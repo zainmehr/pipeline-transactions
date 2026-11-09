@@ -33,3 +33,6 @@ jobs:
 
       - name: Génération des CSV (smoke test)
         run: generate-csv --output data --files 5 --seed 42
+
+      - name: Chargement et traitement (smoke test)
+        run: run-pipeline --input data
