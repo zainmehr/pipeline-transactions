@@ -19,8 +19,8 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 | Tests | pytest, pytest-cov |
 | Qualité du code | ruff (lint + formatage) |
 | CI | GitHub Actions |
-| Base de données | PostgreSQL (à venir) |
-| Conteneurs | Docker Compose (à venir) |
+| Base de données | PostgreSQL 16 (psycopg 3) |
+| Conteneurs | Docker Compose |
 
 ## Structure du projet
 
@@ -30,14 +30,16 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 │   ├── generation/            → génération des fichiers CSV
 │   ├── loading/               → chargement des fichiers
 │   ├── processing/            → traitements (fonctions pures)
-│   ├── storage/               → insertion en base
+│   ├── storage/               → schéma SQL et insertion en base
 │   ├── models.py              → modèles de données partagés (Transaction, ...)
 │   ├── validation.py          → validation des lignes CSV (fonctions pures)
 │   └── main.py                → point d'entrée de la pipeline
 ├── tests/
 │   ├── unit/                  → tests unitaires
 │   └── integration/           → tests d'intégration
-├── sql/                       → schéma de la base
+├── sql/init/                  → scripts d'initialisation du conteneur PostgreSQL
+├── docker-compose.yml         → base PostgreSQL locale
+├── .env.example               → modèle de configuration
 ├── data/                      → fichiers CSV générés (non versionnés)
 └── docs/screenshots/          → captures de la simulation d'échec
 ```
@@ -48,6 +50,8 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 python3 -m venv .venv
 source .venv/bin/activate        # Windows : .venv\Scripts\activate
 pip install -e ".[dev]"
+cp .env.example .env
+docker compose up -d             # lance PostgreSQL (bases « pipeline » et « pipeline_test »)
 ```
 
 ## Utilisation
@@ -104,6 +108,21 @@ La commande charge tous les fichiers `.csv` du dossier, valide chaque ligne, pui
 Si un fichier est invalide, la commande affiche toutes les erreurs avec leur numéro de ligne
 et se termine avec le code retour `1`, ce qui fait échouer la CI.
 
+### Insérer les résultats en base
+
+```bash
+run-pipeline --input data --save
+```
+
+Le schéma est créé automatiquement s'il n'existe pas, puis chaque fichier est inséré avec
+ses transactions et ses sommes. Un fichier déjà inséré (même contenu) est refusé.
+
+Consulter la base :
+
+```bash
+docker compose exec postgres psql -U pipeline -d pipeline
+```
+
 ### Architecture du traitement
 
 ```
@@ -119,26 +138,66 @@ Fichier CSV ──> loading (I/O) ──> validation (pure) ──> processing (
   immuables), ne dépendent d'aucun état externe et renvoient toujours le même résultat
   pour les mêmes entrées. Des tests vérifient explicitement ces trois propriétés.
 
+## Base de données
+
+Le schéma est défini dans `src/pipeline/storage/schema.sql`. Il est idempotent et embarqué
+dans le paquet Python, pour fonctionner aussi dans un conteneur.
+
+| Table | Contenu |
+|---|---|
+| `processed_files` | Fichiers insérés, identifiés par le hash SHA-256 de leur contenu (unique) |
+| `accounts` | Comptes (IBAN, pays), le pays devant correspondre au préfixe de l'IBAN |
+| `banks` | Banques émettrices |
+| `transactions` | Transactions avec leur flag, rattachées à leur fichier, leurs comptes et leur banque |
+| `total_sent_by_iban` | Somme des montants envoyés par IBAN |
+| `total_sent_by_bank` | Somme des montants envoyés par banque |
+| `total_received_by_iban` | Somme des montants reçus par IBAN |
+
+**Normalisation.** Le pays est porté par le compte et la banque par sa table : aucune
+information n'est dupliquée dans `transactions`.
+
+**Sommes cumulées.** Les traitements Python calculent les sommes de chaque fichier, qui
+s'ajoutent aux sommes existantes (`ON CONFLICT ... DO UPDATE SET total = total + ...`).
+Les vues `v_total_sent_by_iban`, `v_total_sent_by_bank` et `v_total_received_by_iban`
+recalculent les mêmes sommes depuis les transactions : les tests vérifient que tables et
+vues sont toujours identiques.
+
+**Atomicité.** L'insertion d'un fichier (fichier, transactions, sommes) se fait dans une
+seule transaction SQL : en cas d'erreur, rien n'est écrit. Combinée à l'unicité du hash,
+elle garantit qu'un fichier n'est jamais compté deux fois.
+
+**Contraintes d'intégrité.** Montant strictement positif, émetteur différent du
+destinataire, clés étrangères : la base refuse les données incohérentes même si la
+validation Python était contournée.
+
 ## Tests et qualité
 
 ```bash
 pytest                                           # tous les tests
 pytest -m "not integration"                      # tests unitaires uniquement
+pytest -m integration                            # tests d'intégration (PostgreSQL requis)
 pytest --cov=pipeline --cov-report=term-missing  # avec couverture
 ruff check . && ruff format --check .            # lint et formatage
 ```
 
+Les tests d'intégration utilisent la base `pipeline_test`, vidée avant chaque test. Si
+PostgreSQL n'est pas lancé, ils sont ignorés en local ; en CI (`REQUIRE_DB=1`), ils échouent.
+
 Reproduire la CI en local avant de pousser :
 
 ```bash
-ruff check . && ruff format --check . && pytest -m "not integration" && generate-csv --files 5 && run-pipeline
+ruff check . && ruff format --check . && pytest && generate-csv --files 5 && run-pipeline
 ```
 
 ## Intégration continue
 
 La CI (GitHub Actions) se déclenche sur chaque Pull Request et sur chaque push sur `main`.
-Elle vérifie le lint, le formatage, les tests unitaires avec couverture, puis exécute
-la génération des CSV et leur traitement.
+Elle comporte deux jobs :
+
+1. **Qualité et tests unitaires** : lint, formatage, tests unitaires avec couverture.
+2. **Base de données et tests d'intégration** (lancé seulement si le premier réussit) :
+   démarre un service PostgreSQL, exécute les tests d'intégration, génère les CSV puis
+   les insère en base avec `run-pipeline --save`.
 
 ## Workflow Git
 
@@ -152,7 +211,7 @@ la génération des CSV et leur traitement.
 ### Niveau 1 — Pipeline data locale
 - [x] 1.1 Génération des données CSV
 - [x] 1.2 Chargement et traitement des données
-- [ ] 1.3 Base de données relationnelle
+- [x] 1.3 Base de données relationnelle
 - [ ] 1.4 Pipeline complète
 - [ ] 1.5 Tests d'intégration automatiques
 - [ ] 1.6 Simulation d'un échec de pipeline
