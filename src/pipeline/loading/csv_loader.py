@@ -7,6 +7,7 @@ Ce module se charge de lire les fichiers ; la validation est déléguée au modu
 from __future__ import annotations
 
 import csv
+import hashlib
 from pathlib import Path
 
 from pipeline.models import Transaction
@@ -21,6 +22,11 @@ class InvalidCSVError(Exception):
         self.errors = errors
         details = "\n".join(f"  - {error}" for error in errors)
         super().__init__(f"Fichier CSV invalide : {path.name} ({len(errors)} erreur(s))\n{details}")
+
+
+def compute_file_hash(path: Path) -> str:
+    """Empreinte SHA-256 du contenu du fichier : identifie un fichier indépendamment de son nom."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def list_csv_files(directory: Path) -> list[Path]:
