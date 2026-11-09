@@ -13,6 +13,7 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
 
 [project.scripts]
 generate-csv = "pipeline.generation.generator:main"
+run-pipeline = "pipeline.main:main"
 
 [build-system]
 requires = ["setuptools>=68"]

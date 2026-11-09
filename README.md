@@ -31,7 +31,9 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 │   ├── loading/               → chargement des fichiers
 │   ├── processing/            → traitements (fonctions pures)
 │   ├── storage/               → insertion en base
-│   └── main.py                → orchestration de la pipeline
+│   ├── models.py              → modèles de données partagés (Transaction, ...)
+│   ├── validation.py          → validation des lignes CSV (fonctions pures)
+│   └── main.py                → point d'entrée de la pipeline
 ├── tests/
 │   ├── unit/                  → tests unitaires
 │   └── integration/           → tests d'intégration
@@ -86,6 +88,37 @@ Chaque fichier contient entre 5 et 10 transactions au format suivant :
 - **IBAN valides** : clé de contrôle modulo 97 conforme à la norme ISO 13616.
 - **Montants en `Decimal`** : aucune erreur d'arrondi liée aux nombres flottants.
 
+### Charger et traiter les fichiers CSV
+
+```bash
+run-pipeline --input data
+```
+
+La commande charge tous les fichiers `.csv` du dossier, valide chaque ligne, puis affiche :
+
+- la somme des montants envoyés par `iban_origine` ;
+- la somme des montants envoyés par `banque_source` ;
+- la somme des montants reçus par `iban_destinataire` ;
+- les transactions flaggées (montant strictement supérieur à 5000).
+
+Si un fichier est invalide, la commande affiche toutes les erreurs avec leur numéro de ligne
+et se termine avec le code retour `1`, ce qui fait échouer la CI.
+
+### Architecture du traitement
+
+```
+Fichier CSV ──> loading (I/O) ──> validation (pure) ──> processing (pur) ──> résultats
+```
+
+- **`loading/`** : lecture des fichiers uniquement, aucune logique métier.
+- **`validation.py`** : conversion d'une ligne en `Transaction` et contrôle du format
+  (colonnes, date ISO 8601, montant positif à 2 décimales, IBAN valide et cohérent avec
+  le pays, émetteur différent du destinataire). Toutes les erreurs d'une ligne sont
+  signalées en une seule fois.
+- **`processing/`** : traitements purs. Ils ne modifient pas leurs entrées (transactions
+  immuables), ne dépendent d'aucun état externe et renvoient toujours le même résultat
+  pour les mêmes entrées. Des tests vérifient explicitement ces trois propriétés.
+
 ## Tests et qualité
 
 ```bash
@@ -98,14 +131,14 @@ ruff check . && ruff format --check .            # lint et formatage
 Reproduire la CI en local avant de pousser :
 
 ```bash
-ruff check . && ruff format --check . && pytest -m "not integration" && generate-csv --files 5
+ruff check . && ruff format --check . && pytest -m "not integration" && generate-csv --files 5 && run-pipeline
 ```
 
 ## Intégration continue
 
 La CI (GitHub Actions) se déclenche sur chaque Pull Request et sur chaque push sur `main`.
 Elle vérifie le lint, le formatage, les tests unitaires avec couverture, puis exécute
-la génération des CSV.
+la génération des CSV et leur traitement.
 
 ## Workflow Git
 
@@ -118,7 +151,7 @@ la génération des CSV.
 
 ### Niveau 1 — Pipeline data locale
 - [x] 1.1 Génération des données CSV
-- [ ] 1.2 Chargement et traitement des données
+- [x] 1.2 Chargement et traitement des données
 - [ ] 1.3 Base de données relationnelle
 - [ ] 1.4 Pipeline complète
 - [ ] 1.5 Tests d'intégration automatiques

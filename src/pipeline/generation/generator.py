@@ -10,22 +10,13 @@ from __future__ import annotations
 import argparse
 import csv
 import random
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from pipeline.generation.accounts import ACCOUNTS
-
-CSV_COLUMNS: tuple[str, ...] = (
-    "datetime_transaction",
-    "iban_origine",
-    "pays_source",
-    "banque_source",
-    "iban_destinataire",
-    "pays_destinataire",
-    "montant",
-)
+from pipeline.models import CSV_COLUMNS, Transaction
 
 MIN_TRANSACTIONS = 5
 MAX_TRANSACTIONS = 10
@@ -41,29 +32,6 @@ EDGE_CASE_AMOUNTS: tuple[Decimal, ...] = (
 )
 HIGH_AMOUNT_PROBABILITY = 0.25
 CENTS = Decimal("0.01")
-
-
-@dataclass(frozen=True)
-class Transaction:
-    datetime_transaction: datetime
-    iban_origine: str
-    pays_source: str
-    banque_source: str
-    iban_destinataire: str
-    pays_destinataire: str
-    montant: Decimal
-
-    def to_row(self) -> dict[str, str]:
-        """Sérialise la transaction en ligne CSV."""
-        return {
-            "datetime_transaction": self.datetime_transaction.isoformat(),
-            "iban_origine": self.iban_origine,
-            "pays_source": self.pays_source,
-            "banque_source": self.banque_source,
-            "iban_destinataire": self.iban_destinataire,
-            "pays_destinataire": self.pays_destinataire,
-            "montant": f"{self.montant:.2f}",
-        }
 
 
 def _random_amount(rng: random.Random) -> Decimal:
