@@ -42,7 +42,7 @@ jobs:
         env:
           POSTGRES_USER: pipeline
           POSTGRES_PASSWORD: pipeline
-          POSTGRES_DB: pipeline_test
+          POSTGRES_DB: pipeline
         ports:
           - 5432:5432
         options: >-
@@ -55,7 +55,7 @@ jobs:
       DB_PORT: 5432
       DB_USER: pipeline
       DB_PASSWORD: pipeline
-      DB_NAME: pipeline_test
+      DB_NAME: pipeline
       TEST_DB_NAME: pipeline_test
       REQUIRE_DB: "1"
     steps:
@@ -71,6 +71,9 @@ jobs:
 
       - name: Installation des dépendances
         run: pip install -e ".[dev]"
+
+      - name: Création de la base de test
+        run: PGPASSWORD=pipeline psql -h localhost -U pipeline -d pipeline -c "CREATE DATABASE pipeline_test;"
 
       - name: Tests d'intégration
         run: pytest -m integration -v
