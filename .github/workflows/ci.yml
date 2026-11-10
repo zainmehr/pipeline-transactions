@@ -97,3 +97,31 @@ jobs:
             WHERE t.total IS DISTINCT FROM v.total")
           echo "Écarts entre sommes stockées et recalculées : $ecarts"
           test "$ecarts" -eq 0
+
+      - name: Pannes temporaires à l'insertion (retry puis succès)
+        run: run-pipeline --input data-retry --generate 3 --seed 1001 --save --simulate-insert-failures 2 --retry-delay 0.5
+
+      - name: Pannes persistantes (arrêt attendu après 3 tentatives)
+        run: |
+          if run-pipeline --input data-echec --generate 3 --seed 1002 --save --simulate-insert-failures 10 --retry-delay 0.2; then
+            echo "La pipeline aurait dû s'arrêter après le nombre maximal de tentatives"
+            exit 1
+          fi
+          echo "Arrêt attendu : la pipeline s'est arrêtée après 3 tentatives"
+
+      - name: Reprise après l'arrêt
+        run: run-pipeline --input data-echec --save
+
+      - name: Vérification finale de la base (aucun doublon)
+        env:
+          PGPASSWORD: pipeline
+        run: |
+          fichiers=$(psql -h localhost -U pipeline -d pipeline -tAc "SELECT COUNT(*) FROM processed_files")
+          echo "Fichiers en base : $fichiers (5 + 3 après retry + 3 après reprise)"
+          test "$fichiers" -eq 11
+          ecarts=$(psql -h localhost -U pipeline -d pipeline -tAc "
+            SELECT COUNT(*) FROM total_sent_by_iban t
+            FULL JOIN v_total_sent_by_iban v USING (iban)
+            WHERE t.total IS DISTINCT FROM v.total")
+          echo "Écarts entre sommes stockées et recalculées : $ecarts"
+          test "$ecarts" -eq 0
