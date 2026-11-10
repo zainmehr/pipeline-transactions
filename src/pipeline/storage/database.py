@@ -72,6 +72,11 @@ def apply_schema(conn: psycopg.Connection) -> None:
         conn.execute(load_schema())
 
 
+def fetch_processed_hashes(conn: psycopg.Connection) -> set[str]:
+    """Retourne les hash de tous les fichiers déjà insérés."""
+    return {row[0] for row in conn.execute("SELECT file_hash FROM processed_files")}
+
+
 def insert_processed_file(
     conn: psycopg.Connection, file_name: str, file_hash: str, result: ProcessingResult
 ) -> int:
