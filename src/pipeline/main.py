@@ -8,13 +8,17 @@
 Un fichier déjà traité (même contenu, donc même hash) est ignoré : la pipeline peut être
 relancée autant de fois que nécessaire sans jamais compter une transaction deux fois.
 Si un seul fichier est invalide, rien n'est inséré et la commande retourne le code 1.
+
+Les accès à la base sont réessayés en cas d'erreur temporaire (base indisponible,
+connexion perdue, ...). Au-delà du nombre maximal de tentatives, la pipeline s'arrête ;
+les fichiers déjà insérés sont conservés et une relance reprend là où elle s'était arrêtée.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -31,6 +35,7 @@ from pipeline.loading.csv_loader import (
 )
 from pipeline.models import ProcessingResult, Transaction
 from pipeline.processing.transformations import FLAG_THRESHOLD, process_transactions
+from pipeline.retry import RetryError, RetryPolicy, retry
 from pipeline.storage.database import (
     DatabaseConfig,
     DuplicateFileError,
@@ -40,9 +45,33 @@ from pipeline.storage.database import (
     insert_processed_file,
 )
 
+# Erreurs considérées comme temporaires, donc réessayées : connexion impossible ou perdue,
+# serveur redémarré, conflit de transaction... (toutes héritent de OperationalError).
+TRANSIENT_DB_ERRORS: tuple[type[BaseException], ...] = (psycopg.OperationalError,)
+
 
 class PipelineError(Exception):
     """Erreur qui arrête la pipeline ; son message est affiché à l'utilisateur."""
+
+
+class SimulatedFailures:
+    """Provoque volontairement les N premières tentatives d'insertion en échec,
+    pour démontrer le mécanisme de retry (option --simulate-insert-failures)."""
+
+    def __init__(self, count: int) -> None:
+        self.remaining = count
+
+    def hook(self, file_name: str) -> Callable[[], None] | None:
+        if self.remaining <= 0:
+            return None
+
+        def fail() -> None:
+            self.remaining -= 1
+            raise psycopg.OperationalError(
+                f"[simulation] connexion perdue pendant l'insertion de {file_name}"
+            )
+
+        return fail
 
 
 @dataclass(frozen=True)
@@ -118,22 +147,57 @@ def load_files(files: Sequence[CsvFile]) -> list[LoadedFile]:
     return loaded
 
 
-def insert_files(conn: psycopg.Connection, files: Sequence[LoadedFile]) -> None:
+def insert_files(
+    config: DatabaseConfig,
+    files: Sequence[LoadedFile],
+    policy: RetryPolicy,
+    failures: SimulatedFailures,
+) -> None:
     for loaded in files:
         name = loaded.file.path.name
+        result = process_transactions(loaded.transactions)
+
+        def attempt(loaded: LoadedFile = loaded, name: str = name, result=result) -> int:
+            # Nouvelle connexion à chaque tentative : la précédente peut avoir été coupée.
+            with connect(config) as conn:
+                return insert_processed_file(
+                    conn, name, loaded.file.file_hash, result, before_commit=failures.hook(name)
+                )
+
         try:
-            file_id = insert_processed_file(
-                conn, name, loaded.file.file_hash, process_transactions(loaded.transactions)
-            )
+            file_id = retry(attempt, policy, TRANSIENT_DB_ERRORS, f"insertion de {name}")
         except DuplicateFileError:
-            # Cas rare : le fichier a été inséré entre la vérification et l'insertion.
+            # Le fichier est déjà en base : soit inséré entre-temps, soit validé par une
+            # tentative dont la confirmation a été perdue. Il n'est pas compté deux fois.
             print(f"  {name} : déjà traité, ignoré")
             continue
         print(f"  {name} inséré (id={file_id}, {len(loaded.transactions)} transactions)")
 
 
-def run(input_dir: Path, generate: int = 0, seed: int = DEFAULT_SEED, save: bool = False) -> None:
+def prepare_database(config: DatabaseConfig, policy: RetryPolicy) -> set[str]:
+    """Crée le schéma si besoin et retourne les hash des fichiers déjà traités."""
+
+    def attempt() -> set[str]:
+        with connect(config) as conn:
+            apply_schema(conn)
+            return fetch_processed_hashes(conn)
+
+    hashes = retry(attempt, policy, TRANSIENT_DB_ERRORS, "connexion à la base")
+    print(f"  base {config.describe()} prête")
+    return hashes
+
+
+def run(
+    input_dir: Path,
+    generate: int = 0,
+    seed: int = DEFAULT_SEED,
+    save: bool = False,
+    policy: RetryPolicy | None = None,
+    simulate_insert_failures: int = 0,
+) -> None:
     """Exécute la pipeline. Lève PipelineError en cas d'échec."""
+    policy = policy or RetryPolicy()
+
     step(1, "Génération des CSV")
     if generate:
         for path in generate_files(input_dir, generate, seed):
@@ -155,24 +219,25 @@ def run(input_dir: Path, generate: int = 0, seed: int = DEFAULT_SEED, save: bool
 
     config = DatabaseConfig.from_env()
     try:
-        with connect(config) as conn:
-            step(2, "Préparation de la base")
-            apply_schema(conn)
-            print(f"  base {config.describe()} prête")
-            new_files = exclude_processed(files, fetch_processed_hashes(conn))
+        step(2, "Préparation de la base")
+        new_files = exclude_processed(files, prepare_database(config, policy))
 
-            step(3, "Chargement et traitement")
-            loaded = load_files(new_files)
-            if loaded:
-                print_report(process_transactions([tx for lf in loaded for tx in lf.transactions]))
-            else:
-                print("  aucun nouveau fichier")
+        step(3, "Chargement et traitement")
+        loaded = load_files(new_files)
+        if loaded:
+            print_report(process_transactions([tx for lf in loaded for tx in lf.transactions]))
+        else:
+            print("  aucun nouveau fichier")
 
-            step(4, "Insertion en base")
-            insert_files(conn, loaded)
-    except psycopg.OperationalError as error:
+        step(4, "Insertion en base")
+        if simulate_insert_failures:
+            print(f"  [simulation] les {simulate_insert_failures} prochaines insertions échoueront")
+        insert_files(config, loaded, policy, SimulatedFailures(simulate_insert_failures))
+    except RetryError as error:
         raise PipelineError(
-            f"base de données inaccessible ({config.describe()}) : {error}"
+            f"base de données inaccessible ({config.describe()}) : {error}\n"
+            "Les fichiers déjà insérés sont conservés ; relancer la pipeline reprendra "
+            "le traitement là où il s'est arrêté."
         ) from error
 
 
@@ -185,10 +250,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Graine de génération")
     parser.add_argument("--save", action="store_true", help="Insère les résultats en base")
+    parser.add_argument(
+        "--max-attempts", type=int, default=3, help="Nombre maximal de tentatives (défaut : 3)"
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=1.0,
+        help="Attente avant la 2e tentative, doublée ensuite (défaut : 1 s)",
+    )
+    parser.add_argument(
+        "--simulate-insert-failures",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Démonstration : fait échouer les N premières tentatives d'insertion",
+    )
     args = parser.parse_args(argv)
 
     try:
-        run(args.input, args.generate, args.seed, args.save)
+        policy = RetryPolicy(max_attempts=args.max_attempts, initial_delay=args.retry_delay)
+    except ValueError as error:
+        parser.error(str(error))
+
+    try:
+        run(
+            args.input,
+            args.generate,
+            args.seed,
+            args.save,
+            policy,
+            args.simulate_insert_failures,
+        )
     except PipelineError as error:
         print(f"\nERREUR : {error}", file=sys.stderr)
         print("\nPipeline en échec.", file=sys.stderr)

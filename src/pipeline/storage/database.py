@@ -7,7 +7,7 @@ des sommes sont écrits dans une seule transaction SQL. En cas d'erreur, rien n'
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib.resources import files
 
@@ -78,11 +78,17 @@ def fetch_processed_hashes(conn: psycopg.Connection) -> set[str]:
 
 
 def insert_processed_file(
-    conn: psycopg.Connection, file_name: str, file_hash: str, result: ProcessingResult
+    conn: psycopg.Connection,
+    file_name: str,
+    file_hash: str,
+    result: ProcessingResult,
+    before_commit: Callable[[], None] | None = None,
 ) -> int:
     """Insère un fichier traité et ses résultats. Retourne l'identifiant du fichier.
 
     Lève DuplicateFileError si un fichier de même contenu a déjà été inséré.
+    `before_commit` est appelé juste avant la validation de la transaction : une exception
+    levée à ce moment annule toute l'insertion (utilisé pour simuler une panne).
     """
     transactions = [ft.transaction for ft in result.transactions]
     accounts = sorted(
@@ -151,6 +157,9 @@ def insert_processed_file(
                 "total = total_received_by_iban.total + EXCLUDED.total, updated_at = now()",
                 list(result.received_by_iban.items()),
             )
+
+            if before_commit is not None:
+                before_commit()
     except psycopg.errors.UniqueViolation as error:
         if error.diag.constraint_name == FILE_HASH_CONSTRAINT:
             raise DuplicateFileError(f"Fichier déjà inséré en base : {file_name}") from error
