@@ -93,7 +93,7 @@ def test_pipeline_complete_avec_generation(pipeline_env, tmp_path, capsys):
     )
 
     sortie = capsys.readouterr().out
-    for etape in ["[1/4]", "[2/4]", "[3/4]", "[4/4]", "terminée avec succès"]:
+    for etape in ["[1/5]", "[2/5]", "[3/5]", "[4/5]", "[5/5]", "terminée avec succès"]:
         assert etape in sortie
 
 

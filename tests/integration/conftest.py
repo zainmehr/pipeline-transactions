@@ -1,18 +1,22 @@
-"""Fixtures des tests d'intégration (base PostgreSQL réelle).
+"""Fixtures des tests d'intégration (PostgreSQL et stockage S3 réels).
 
 Les tests utilisent la base TEST_DB_NAME (par défaut « pipeline_test »), vidée avant
-chaque test. Si PostgreSQL est inaccessible, ils sont ignorés en local, mais échouent
-lorsque REQUIRE_DB=1 (cas de la CI), pour qu'un problème ne passe jamais inaperçu.
+chaque test, et un bucket S3 temporaire propre à chaque test. Si un service est
+inaccessible, ses tests sont ignorés en local, mais échouent lorsque REQUIRE_DB=1 ou
+REQUIRE_S3=1 (cas de la CI), pour qu'un problème ne passe jamais inaperçu.
 """
 
 import os
+import uuid
 from dataclasses import replace
 
 import psycopg
 import pytest
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 from pipeline.storage.database import DatabaseConfig, apply_schema, connect
+from pipeline.storage.s3 import S3Config, create_client
 
 TABLES = (
     "total_sent_by_iban, total_sent_by_bank, total_received_by_iban, "
@@ -61,3 +65,34 @@ def pipeline_env(db, db_config, monkeypatch):
     }.items():
         monkeypatch.setenv(var, value)
     return db
+
+
+@pytest.fixture(scope="session")
+def s3_base_config():
+    load_dotenv()
+    config = S3Config.from_env()
+    try:
+        create_client(config, timeout=3).list_buckets()
+    except (BotoCoreError, ClientError) as error:
+        message = f"Stockage S3 inaccessible ({config.endpoint_url}) : {error}"
+        if os.environ.get("REQUIRE_S3") == "1":
+            pytest.fail(message)
+        pytest.skip(f"{message} — lancez `docker compose up -d`")
+    return config
+
+
+@pytest.fixture
+def s3(s3_base_config, monkeypatch):
+    """Bucket S3 temporaire, unique pour chaque test et supprimé ensuite.
+    Les variables d'environnement pointent vers lui, comme en ligne de commande."""
+    config = replace(s3_base_config, bucket=f"test-{uuid.uuid4().hex[:12]}")
+    monkeypatch.setenv("S3_BUCKET", config.bucket)
+    client = create_client(config)
+    yield config, client
+    try:
+        objects = client.list_objects_v2(Bucket=config.bucket).get("Contents", [])
+        for obj in objects:
+            client.delete_object(Bucket=config.bucket, Key=obj["Key"])
+        client.delete_bucket(Bucket=config.bucket)
+    except ClientError:
+        pass  # le bucket n'a pas été créé par le test
