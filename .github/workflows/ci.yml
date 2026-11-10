@@ -50,6 +50,14 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
+      rustfs:
+        image: rustfs/rustfs:1.0.0
+        env:
+          RUSTFS_ACCESS_KEY: pipeline
+          RUSTFS_SECRET_KEY: pipeline-secret
+          RUSTFS_ADDRESS: ":9000"
+        ports:
+          - 9000:9000
     env:
       DB_HOST: localhost
       DB_PORT: 5432
@@ -58,6 +66,11 @@ jobs:
       DB_NAME: pipeline
       TEST_DB_NAME: pipeline_test
       REQUIRE_DB: "1"
+      S3_ENDPOINT_URL: http://localhost:9000
+      S3_ACCESS_KEY: pipeline
+      S3_SECRET_KEY: pipeline-secret
+      S3_BUCKET: transactions
+      REQUIRE_S3: "1"
     steps:
       - name: Récupération du code
         uses: actions/checkout@v4
@@ -72,17 +85,32 @@ jobs:
       - name: Installation des dépendances
         run: pip install -e ".[dev]"
 
+      - name: Attente du stockage S3
+        run: |
+          for i in $(seq 60); do
+            if curl -fsS http://localhost:9000/health > /dev/null; then echo "Stockage S3 prêt"; exit 0; fi
+            sleep 1
+          done
+          echo "Le stockage S3 ne répond pas"
+          exit 1
+
       - name: Création de la base de test
         run: PGPASSWORD=pipeline psql -h localhost -U pipeline -d pipeline -c "CREATE DATABASE pipeline_test;"
 
       - name: Tests d'intégration
         run: pytest -m integration -v
 
-      - name: Pipeline complète (génération, traitement, insertion)
-        run: run-pipeline --input data --generate 5 --seed 42 --save
+      - name: Pipeline complète (génération, envoi S3, traitement, insertion)
+        run: run-pipeline --input data --generate 5 --seed 42 --upload --save
 
       - name: Relance de la pipeline (aucun doublon attendu)
-        run: run-pipeline --input data --generate 5 --seed 42 --save
+        run: run-pipeline --input data --generate 5 --seed 42 --upload --save
+
+      - name: Vérification du contenu du bucket S3
+        run: |
+          list-s3
+          fichiers=$(list-s3 | grep -c '^s3://')
+          test "$fichiers" -eq 5
 
       - name: Vérification du contenu de la base
         env:

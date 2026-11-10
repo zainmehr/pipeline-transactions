@@ -8,7 +8,7 @@ Pipeline data automatisée allant de la génération de transactions financière
 jusqu'à leur insertion dans une base de données relationnelle, intégrée à une démarche CI/CD :
 
 ```
-Génération CSV → Chargement → Validation → Traitement → Base de données
+Génération CSV → Stockage S3 → Chargement → Validation → Traitement → Base de données
 ```
 
 ## Stack technique
@@ -20,6 +20,7 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 | Qualité du code | ruff (lint + formatage) |
 | CI | GitHub Actions |
 | Base de données | PostgreSQL 16 (psycopg 3) |
+| Stockage objet | RustFS 1.0, compatible S3 (boto3) |
 | Conteneurs | Docker Compose |
 
 ## Structure du projet
@@ -30,7 +31,7 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 │   ├── generation/            → génération des fichiers CSV
 │   ├── loading/               → chargement des fichiers
 │   ├── processing/            → traitements (fonctions pures)
-│   ├── storage/               → schéma SQL et insertion en base
+│   ├── storage/               → schéma SQL, insertion en base et stockage S3
 │   ├── models.py              → modèles de données partagés (Transaction, ...)
 │   ├── validation.py          → validation des lignes CSV (fonctions pures)
 │   ├── retry.py               → mécanisme de nouvelle tentative (retry)
@@ -39,7 +40,7 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 │   ├── unit/                  → tests unitaires
 │   └── integration/           → tests d'intégration
 ├── sql/init/                  → scripts d'initialisation du conteneur PostgreSQL
-├── docker-compose.yml         → base PostgreSQL locale
+├── docker-compose.yml         → PostgreSQL et RustFS (S3) en local
 ├── Makefile                   → raccourcis (make pipeline, make test, ...)
 ├── .env.example               → modèle de configuration
 ├── data/                      → fichiers CSV générés (non versionnés)
@@ -61,8 +62,9 @@ cp .env.example .env
 make pipeline
 ```
 
-Cette commande unique démarre PostgreSQL (en attendant qu'il soit prêt), génère les CSV,
-les charge, les valide, les traite et insère les résultats en base. `make` seul affiche
+Cette commande unique démarre PostgreSQL et le stockage S3 (en attendant qu'ils soient
+prêts), génère les CSV, les envoie dans le bucket S3 et vérifie leur présence, puis les
+charge, les valide, les traite et insère les résultats en base. `make` seul affiche
 toutes les commandes disponibles :
 
 | Commande | Rôle |
@@ -72,7 +74,9 @@ toutes les commandes disponibles :
 | `make ci` | Reproduit la CI en local (style + tests) |
 | `make format` | Corrige automatiquement le style du code |
 | `make db-shell` | Terminal SQL sur la base |
-| `make db-reset` | Vide la base et la redémarre |
+| `make up` | Démarre PostgreSQL et le stockage S3 |
+| `make s3-ls` | Liste les fichiers présents dans le bucket S3 |
+| `make db-reset` | Vide la base et le stockage S3, puis les redémarre |
 | `make demo-retry` | Démo : 2 pannes simulées à l'insertion, puis succès |
 | `make demo-retry-echec` | Démo : pannes répétées, arrêt après 3 tentatives |
 | `make demo-panne` | Démo réelle : PostgreSQL arrêté puis redémarré pendant la pipeline |
@@ -118,7 +122,7 @@ Chaque fichier contient entre 5 et 10 transactions au format suivant :
 ### La pipeline en détail
 
 ```bash
-run-pipeline --input data --generate 5 --seed 42 --save
+run-pipeline --input data --generate 5 --seed 42 --upload --save
 ```
 
 | Option | Rôle |
@@ -126,20 +130,23 @@ run-pipeline --input data --generate 5 --seed 42 --save
 | `--input` | Dossier des fichiers CSV (défaut : `data`) |
 | `--generate N` | Génère N fichiers avant le traitement |
 | `--seed` | Graine de génération (défaut : 42) |
+| `--upload` | Envoie les CSV dans le bucket S3 et vérifie leur présence |
 | `--save` | Insère les résultats en base |
 | `--max-attempts` | Nombre maximal de tentatives par accès à la base (défaut : 3) |
 | `--retry-delay` | Attente avant la 2e tentative, doublée ensuite (défaut : 1 s) |
 | `--simulate-insert-failures N` | Démonstration : fait échouer les N premières tentatives d'insertion |
 
-La pipeline s'exécute en quatre étapes affichées dans le terminal :
+La pipeline s'exécute en cinq étapes affichées dans le terminal :
 
 1. **Génération des CSV** (avec `--generate`).
-2. **Préparation de la base** (avec `--save`) : création du schéma s'il n'existe pas, puis
+2. **Envoi vers le stockage S3** (avec `--upload`) : création du bucket s'il n'existe pas,
+   envoi des fichiers, puis vérification de leur présence et de leur intégrité.
+3. **Préparation de la base** (avec `--save`) : création du schéma s'il n'existe pas, puis
    exclusion des fichiers déjà traités.
-3. **Chargement et traitement** : validation de tous les nouveaux fichiers, puis calcul des
+4. **Chargement et traitement** : validation de tous les nouveaux fichiers, puis calcul des
    sommes envoyées par `iban_origine`, envoyées par `banque_source` et reçues par
    `iban_destinataire`, et flag des transactions de plus de 5000 (rapport affiché).
-4. **Insertion en base** (avec `--save`) : chaque fichier est inséré avec ses transactions
+5. **Insertion en base** (avec `--save`) : chaque fichier est inséré avec ses transactions
    et ses sommes, dans une transaction SQL unique.
 
 **Aucun double traitement.** Un fichier est identifié par le hash SHA-256 de son contenu.
@@ -149,6 +156,31 @@ fois que nécessaire sans jamais compter une transaction deux fois.
 **Tout ou rien.** Tous les nouveaux fichiers sont validés avant la première insertion. Si un
 seul est invalide, la commande affiche toutes les erreurs avec leur numéro de ligne, n'insère
 rien et se termine avec le code retour `1`, ce qui fait échouer la CI.
+
+### Stockage S3
+
+Les fichiers CSV sont stockés dans un service compatible S3, **RustFS**, lancé en local
+avec Docker Compose et en CI comme service du job d'intégration. Aucun service cloud
+n'est utilisé. Sa console web est accessible sur http://localhost:9001, avec les
+identifiants `S3_ACCESS_KEY` et `S3_SECRET_KEY` du fichier `.env`.
+
+| Variable | Rôle | Défaut |
+|---|---|---|
+| `S3_ENDPOINT_URL` | Adresse de l'API S3 | `http://localhost:9000` |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Identifiants | `pipeline` / `pipeline-secret` |
+| `S3_BUCKET` | Nom du bucket | `transactions` |
+
+L'étape d'envoi, définie dans `src/pipeline/storage/s3.py` :
+
+1. **crée le bucket** s'il n'existe pas (l'opération est idempotente) ;
+2. **envoie chaque fichier** sous la clé `transactions/<nom du fichier>`, avec en
+   métadonnée l'empreinte SHA-256 de son contenu ;
+3. **vérifie** que chaque fichier est présent dans le bucket et que l'empreinte stockée
+   correspond à celle du fichier envoyé. Sinon, la pipeline s'arrête en erreur.
+
+Les accès au stockage S3 bénéficient du même mécanisme de retry que la base : un service
+en cours de démarrage ou momentanément indisponible ne fait pas échouer la pipeline.
+`make s3-ls` (ou la commande `list-s3`) affiche le contenu du bucket.
 
 ### Retry en cas de problème temporaire
 
@@ -245,8 +277,12 @@ Les tests d'intégration (`tests/integration/`) couvrent la base seule (`test_da
 et la pipeline complète de bout en bout (`test_pipeline.py`) : valeurs attendues calculées à
 la main, données générées, relance sans doublon, ajout d'un nouveau fichier, fichier
 invalide. `test_retry_pipeline.py` couvre les pannes simulées, l'arrêt après le nombre
-maximal de tentatives, la reprise et l'absence de doublons. Ils utilisent la base `pipeline_test`, vidée avant chaque test. Si
-PostgreSQL n'est pas lancé, ils sont ignorés en local ; en CI (`REQUIRE_DB=1`), ils échouent.
+maximal de tentatives, la reprise et l'absence de doublons. `test_s3.py` couvre la
+création du bucket, l'envoi, la vérification d'intégrité et la commande `list-s3`.
+
+Les tests utilisent la base `pipeline_test`, vidée avant chaque test, et un bucket S3
+temporaire propre à chaque test, supprimé ensuite. Si un service n'est pas lancé, ses tests
+sont ignorés en local ; en CI (`REQUIRE_DB=1`, `REQUIRE_S3=1`), ils échouent.
 
 Reproduire la CI en local avant de pousser :
 
@@ -261,9 +297,10 @@ Elle comporte deux jobs :
 
 1. **Qualité et tests unitaires** : lint, formatage, tests unitaires avec couverture.
 2. **Base de données et tests d'intégration** (lancé seulement si le premier réussit) :
-   démarre un service PostgreSQL, exécute les tests d'intégration, lance la pipeline
-   complète, la relance pour vérifier l'absence de doublons, puis contrôle directement en
-   SQL le nombre de fichiers en base et la cohérence des sommes. Il simule ensuite des
+   démarre PostgreSQL et RustFS, exécute les tests d'intégration, lance la pipeline
+   complète avec envoi vers S3, la relance pour vérifier l'absence de doublons, contrôle
+   le contenu du bucket, puis contrôle directement en SQL le nombre de fichiers en base et
+   la cohérence des sommes. Il simule ensuite des
    pannes temporaires (retry puis succès), des pannes persistantes (arrêt attendu), une
    reprise après l'arrêt, et vérifie à nouveau la base.
 
@@ -286,8 +323,8 @@ Elle comporte deux jobs :
 - [x] 1.7 Retry lors de l'insertion en base
 
 ### Niveau 2 — Stockage S3
-- [ ] 2.1 Stockage des fichiers dans un service S3
-- [ ] 2.2 Upload automatique dans le S3
+- [x] 2.1 Stockage des fichiers dans un service S3
+- [x] 2.2 Upload automatique dans le S3
 - [ ] 2.3 Lecture des données depuis le S3
 - [ ] 2.4 Retry lors de la récupération depuis le S3
 
