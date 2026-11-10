@@ -1,18 +1,21 @@
 """Point d'entrée de la pipeline : orchestre toutes les étapes.
 
-    [1/5] Génération des CSV            (option --generate N)
-    [2/5] Envoi vers le stockage S3     (option --upload) : bucket, envoi, vérification
-    [3/5] Préparation de la base        (option --save) : schéma + fichiers déjà traités
-    [4/5] Chargement et traitement      : validation de tous les nouveaux fichiers
-    [5/5] Insertion en base             (option --save)
+    [1/6] Génération des CSV            (option --generate N)
+    [2/6] Envoi vers le stockage S3     (option --upload) : bucket, envoi, vérification
+    [3/6] Préparation de la base        (option --save) : schéma + fichiers déjà traités
+    [4/6] Récupération des fichiers     (option --source local|s3)
+    [5/6] Chargement et traitement      : validation de tous les nouveaux fichiers
+    [6/6] Insertion en base             (option --save)
 
 Un fichier déjà traité (même contenu, donc même hash) est ignoré : la pipeline peut être
 relancée autant de fois que nécessaire sans jamais compter une transaction deux fois.
-Si un seul fichier est invalide, rien n'est inséré et la commande retourne le code 1.
+Si un seul fichier est invalide ou irrécupérable, rien n'est inséré et la commande
+retourne le code 1.
 
-Les accès à la base sont réessayés en cas d'erreur temporaire (base indisponible,
-connexion perdue, ...). Au-delà du nombre maximal de tentatives, la pipeline s'arrête ;
-les fichiers déjà insérés sont conservés et une relance reprend là où elle s'était arrêtée.
+Les accès à la base et au stockage S3 sont réessayés en cas d'erreur temporaire
+(service indisponible, connexion perdue, ...). Au-delà du nombre maximal de tentatives,
+la pipeline s'arrête ; les fichiers déjà insérés sont conservés et une relance reprend
+là où elle s'était arrêtée.
 """
 
 from __future__ import annotations
@@ -29,11 +32,12 @@ from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 from pipeline.generation.generator import DEFAULT_SEED, generate_files
-from pipeline.loading.csv_loader import (
-    InvalidCSVError,
-    compute_file_hash,
-    list_csv_files,
-    load_csv,
+from pipeline.loading.csv_loader import InvalidCSVError, parse_csv
+from pipeline.loading.sources import (
+    SourceFile,
+    exclude_processed,
+    fetch_s3_files,
+    read_local_files,
 )
 from pipeline.models import ProcessingResult, Transaction
 from pipeline.processing.transformations import FLAG_THRESHOLD, process_transactions
@@ -48,7 +52,9 @@ from pipeline.storage.database import (
 )
 from pipeline.storage.s3 import (
     TRANSIENT_S3_ERRORS,
+    ObjectNotFoundError,
     S3Config,
+    TransientS3Error,
     create_client,
     ensure_bucket,
     list_keys,
@@ -61,47 +67,62 @@ from pipeline.storage.s3 import (
 # serveur redémarré, conflit de transaction... (toutes héritent de OperationalError).
 TRANSIENT_DB_ERRORS: tuple[type[BaseException], ...] = (psycopg.OperationalError,)
 
+SOURCES = ("local", "s3")
+
 
 class PipelineError(Exception):
     """Erreur qui arrête la pipeline ; son message est affiché à l'utilisateur."""
 
 
 class SimulatedFailures:
-    """Provoque volontairement les N premières tentatives d'insertion en échec,
-    pour démontrer le mécanisme de retry (option --simulate-insert-failures)."""
+    """Provoque volontairement l'échec des N prochaines tentatives d'une opération,
+    pour démontrer le mécanisme de retry (options --simulate-*-failures)."""
 
-    def __init__(self, count: int) -> None:
+    def __init__(self, count: int, make_error: Callable[[str], BaseException]) -> None:
         self.remaining = count
+        self.make_error = make_error
 
-    def hook(self, file_name: str) -> Callable[[], None] | None:
+    def trigger(self, label: str) -> None:
+        """Lève l'erreur simulée tant qu'il reste des échecs à provoquer."""
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise self.make_error(label)
+
+    def hook(self, label: str) -> Callable[[], None] | None:
+        """Comme trigger, mais à appeler plus tard (ex. juste avant un commit SQL)."""
         if self.remaining <= 0:
             return None
-
-        def fail() -> None:
-            self.remaining -= 1
-            raise psycopg.OperationalError(
-                f"[simulation] connexion perdue pendant l'insertion de {file_name}"
-            )
-
-        return fail
+        return lambda: self.trigger(label)
 
 
-@dataclass(frozen=True)
-class CsvFile:
-    path: Path
-    file_hash: str
+def insert_failures(count: int) -> SimulatedFailures:
+    return SimulatedFailures(
+        count,
+        lambda name: psycopg.OperationalError(
+            f"[simulation] connexion perdue pendant l'insertion de {name}"
+        ),
+    )
+
+
+def download_failures(count: int) -> SimulatedFailures:
+    return SimulatedFailures(
+        count,
+        lambda name: TransientS3Error(
+            f"[simulation] stockage S3 indisponible pendant la récupération de {name}"
+        ),
+    )
 
 
 @dataclass(frozen=True)
 class LoadedFile:
-    file: CsvFile
+    file: SourceFile
     transactions: list[Transaction]
 
 
 # --- Affichage ---------------------------------------------------------------
 
 
-TOTAL_STEPS = 5
+TOTAL_STEPS = 6
 
 
 def step(number: int, title: str) -> None:
@@ -128,68 +149,17 @@ def print_report(result: ProcessingResult) -> None:
 # --- Étapes ------------------------------------------------------------------
 
 
-def discover_files(directory: Path) -> list[CsvFile]:
+def read_local(directory: Path) -> list[SourceFile]:
     try:
-        paths = list_csv_files(directory)
+        files = read_local_files(directory)
     except FileNotFoundError as error:
         raise PipelineError(str(error)) from error
-    if not paths:
+    if not files:
         raise PipelineError(f"aucun fichier CSV dans {directory}")
-    return [CsvFile(path, compute_file_hash(path)) for path in paths]
+    return files
 
 
-def exclude_processed(files: Sequence[CsvFile], processed_hashes: set[str]) -> list[CsvFile]:
-    new_files = []
-    for file in files:
-        if file.file_hash in processed_hashes:
-            print(f"  {file.path.name} : déjà traité, ignoré")
-        else:
-            new_files.append(file)
-    print(f"  {len(new_files)} nouveau(x) fichier(s) à traiter sur {len(files)}")
-    return new_files
-
-
-def load_files(files: Sequence[CsvFile]) -> list[LoadedFile]:
-    """Charge et valide tous les fichiers avant toute insertion."""
-    loaded = []
-    for file in files:
-        try:
-            transactions = load_csv(file.path)
-        except InvalidCSVError as error:
-            raise PipelineError(f"{error}\nAucune donnée n'a été insérée.") from error
-        print(f"  {file.path.name} : {len(transactions)} transactions chargées")
-        loaded.append(LoadedFile(file, transactions))
-    return loaded
-
-
-def insert_files(
-    config: DatabaseConfig,
-    files: Sequence[LoadedFile],
-    policy: RetryPolicy,
-    failures: SimulatedFailures,
-) -> None:
-    for loaded in files:
-        name = loaded.file.path.name
-        result = process_transactions(loaded.transactions)
-
-        def attempt(loaded: LoadedFile = loaded, name: str = name, result=result) -> int:
-            # Nouvelle connexion à chaque tentative : la précédente peut avoir été coupée.
-            with connect(config) as conn:
-                return insert_processed_file(
-                    conn, name, loaded.file.file_hash, result, before_commit=failures.hook(name)
-                )
-
-        try:
-            file_id = retry(attempt, policy, TRANSIENT_DB_ERRORS, f"insertion de {name}")
-        except DuplicateFileError:
-            # Le fichier est déjà en base : soit inséré entre-temps, soit validé par une
-            # tentative dont la confirmation a été perdue. Il n'est pas compté deux fois.
-            print(f"  {name} : déjà traité, ignoré")
-            continue
-        print(f"  {name} inséré (id={file_id}, {len(loaded.transactions)} transactions)")
-
-
-def upload_files(config: S3Config, files: Sequence[CsvFile], policy: RetryPolicy) -> None:
+def upload_files(config: S3Config, files: Sequence[SourceFile], policy: RetryPolicy) -> None:
     """Crée le bucket si besoin, y envoie les fichiers, puis vérifie leur présence."""
     client = create_client(config)
 
@@ -201,16 +171,18 @@ def upload_files(config: S3Config, files: Sequence[CsvFile], policy: RetryPolicy
 
     for file in files:
         key = call(
-            lambda file=file: upload_file(client, config.bucket, file.path, file.file_hash),
-            f"envoi de {file.path.name}",
+            lambda file=file: upload_file(
+                client, config.bucket, file.name, file.content, file.file_hash
+            ),
+            f"envoi de {file.name}",
         )
-        print(f"  {file.path.name} envoyé vers s3://{config.bucket}/{key}")
+        print(f"  {file.name} envoyé vers s3://{config.bucket}/{key}")
 
     # Vérification : chaque fichier est présent et son contenu est celui qui a été envoyé.
     present = set(call(lambda: list_keys(client, config.bucket), "liste des objets du bucket"))
     problems = []
     for file in files:
-        key = object_key(file.path.name)
+        key = object_key(file.name, file.file_hash)
         if key not in present:
             problems.append(f"{key} : absent du bucket")
             continue
@@ -238,6 +210,87 @@ def prepare_database(config: DatabaseConfig, policy: RetryPolicy) -> set[str]:
     return hashes
 
 
+def retrieve_from_s3(
+    config: S3Config,
+    processed_hashes: set[str],
+    policy: RetryPolicy,
+    failures: SimulatedFailures,
+) -> list[SourceFile]:
+    print(f"  source : {config.describe()}")
+    if failures.remaining:
+        print(f"  [simulation] les {failures.remaining} prochains téléchargements échoueront")
+    try:
+        files, total = fetch_s3_files(
+            create_client(config), config.bucket, processed_hashes, policy, failures.trigger
+        )
+    except RetryError as error:
+        raise PipelineError(
+            f"stockage S3 inaccessible ({config.describe()}) : {error}\n"
+            "Le traitement est arrêté : aucune donnée n'a été insérée. Relancer la pipeline "
+            "une fois le stockage disponible."
+        ) from error
+    except (ObjectNotFoundError, ClientError, BotoCoreError) as error:
+        raise PipelineError(
+            f"erreur du stockage S3 ({config.describe()}) : {error}\n"
+            "Le traitement est arrêté : aucune donnée n'a été insérée."
+        ) from error
+    if total == 0:
+        raise PipelineError(f"aucun fichier CSV dans {config.describe()}")
+    return files
+
+
+def load_files(files: Sequence[SourceFile]) -> list[LoadedFile]:
+    """Décode et valide tous les fichiers avant toute insertion."""
+    loaded = []
+    for file in files:
+        try:
+            transactions = parse_csv(file.content, file.name)
+        except InvalidCSVError as error:
+            raise PipelineError(f"{error}\nAucune donnée n'a été insérée.") from error
+        print(f"  {file.name} : {len(transactions)} transactions chargées")
+        loaded.append(LoadedFile(file, transactions))
+    return loaded
+
+
+def insert_files(
+    config: DatabaseConfig,
+    files: Sequence[LoadedFile],
+    policy: RetryPolicy,
+    failures: SimulatedFailures,
+) -> None:
+    for loaded in files:
+        name = loaded.file.name
+        result = process_transactions(loaded.transactions)
+
+        def attempt(loaded: LoadedFile = loaded, name: str = name, result=result) -> int:
+            # Nouvelle connexion à chaque tentative : la précédente peut avoir été coupée.
+            with connect(config) as conn:
+                return insert_processed_file(
+                    conn,
+                    loaded.file.origin,
+                    loaded.file.file_hash,
+                    result,
+                    before_commit=failures.hook(name),
+                )
+
+        try:
+            file_id = retry(attempt, policy, TRANSIENT_DB_ERRORS, f"insertion de {name}")
+        except DuplicateFileError:
+            # Le fichier est déjà en base : soit inséré entre-temps, soit validé par une
+            # tentative dont la confirmation a été perdue. Il n'est pas compté deux fois.
+            print(f"  {name} : déjà traité, ignoré")
+            continue
+        print(f"  {name} inséré (id={file_id}, {len(loaded.transactions)} transactions)")
+
+
+def db_unavailable(config: DatabaseConfig, error: RetryError) -> PipelineError:
+    return PipelineError(
+        f"base de données inaccessible ({config.describe()}) : {error}\n"
+        "Les fichiers déjà insérés sont conservés ; relancer la pipeline reprendra "
+        "le traitement là où il s'est arrêté."
+    )
+
+
 def run(
     input_dir: Path,
     generate: int = 0,
@@ -246,9 +299,15 @@ def run(
     policy: RetryPolicy | None = None,
     simulate_insert_failures: int = 0,
     upload: bool = False,
+    source: str = "local",
+    simulate_download_failures: int = 0,
 ) -> None:
     """Exécute la pipeline. Lève PipelineError en cas d'échec."""
+    if source not in SOURCES:
+        raise PipelineError(f"source inconnue : {source!r} (attendu : {', '.join(SOURCES)})")
     policy = policy or RetryPolicy()
+    s3_config = S3Config.from_env()
+    db_config = DatabaseConfig.from_env()
 
     step(1, "Génération des CSV")
     if generate:
@@ -257,13 +316,10 @@ def run(
     else:
         print("  ignorée (utiliser --generate N)")
 
-    files = discover_files(input_dir)
-
     step(2, "Envoi vers le stockage S3")
     if upload:
-        s3_config = S3Config.from_env()
         try:
-            upload_files(s3_config, files, policy)
+            upload_files(s3_config, read_local(input_dir), policy)
         except RetryError as error:
             raise PipelineError(
                 f"stockage S3 inaccessible ({s3_config.describe()}) : {error}"
@@ -275,38 +331,45 @@ def run(
     else:
         print("  ignoré (utiliser --upload)")
 
-    if not save:
-        step(3, "Préparation de la base")
+    step(3, "Préparation de la base")
+    processed_hashes: set[str] = set()
+    if save:
+        try:
+            processed_hashes = prepare_database(db_config, policy)
+        except RetryError as error:
+            raise db_unavailable(db_config, error) from error
+    else:
         print("  ignorée (utiliser --save)")
-        step(4, "Chargement et traitement")
-        loaded = load_files(files)
+
+    step(4, "Récupération des fichiers")
+    if source == "s3":
+        new_files = retrieve_from_s3(
+            s3_config, processed_hashes, policy, download_failures(simulate_download_failures)
+        )
+    else:
+        print(f"  source : dossier local {input_dir}")
+        new_files = exclude_processed(read_local(input_dir), processed_hashes)
+
+    step(5, "Chargement et traitement")
+    loaded = load_files(new_files)
+    if loaded:
         print_report(process_transactions([tx for lf in loaded for tx in lf.transactions]))
-        step(5, "Insertion en base")
+    else:
+        print("  aucun nouveau fichier")
+
+    step(6, "Insertion en base")
+    if not save:
         print("  ignorée (utiliser --save)")
         return
-
-    config = DatabaseConfig.from_env()
+    if not loaded:
+        print("  aucun fichier à insérer")
+        return
+    if simulate_insert_failures:
+        print(f"  [simulation] les {simulate_insert_failures} prochaines insertions échoueront")
     try:
-        step(3, "Préparation de la base")
-        new_files = exclude_processed(files, prepare_database(config, policy))
-
-        step(4, "Chargement et traitement")
-        loaded = load_files(new_files)
-        if loaded:
-            print_report(process_transactions([tx for lf in loaded for tx in lf.transactions]))
-        else:
-            print("  aucun nouveau fichier")
-
-        step(5, "Insertion en base")
-        if simulate_insert_failures:
-            print(f"  [simulation] les {simulate_insert_failures} prochaines insertions échoueront")
-        insert_files(config, loaded, policy, SimulatedFailures(simulate_insert_failures))
+        insert_files(db_config, loaded, policy, insert_failures(simulate_insert_failures))
     except RetryError as error:
-        raise PipelineError(
-            f"base de données inaccessible ({config.describe()}) : {error}\n"
-            "Les fichiers déjà insérés sont conservés ; relancer la pipeline reprendra "
-            "le traitement là où il s'est arrêté."
-        ) from error
+        raise db_unavailable(db_config, error) from error
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -319,6 +382,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Graine de génération")
     parser.add_argument(
         "--upload", action="store_true", help="Envoie les CSV dans le stockage S3 et vérifie"
+    )
+    parser.add_argument(
+        "--source",
+        choices=SOURCES,
+        default="local",
+        help="Origine des fichiers à traiter : dossier local ou bucket S3 (défaut : local)",
     )
     parser.add_argument("--save", action="store_true", help="Insère les résultats en base")
     parser.add_argument(
@@ -337,6 +406,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="N",
         help="Démonstration : fait échouer les N premières tentatives d'insertion",
     )
+    parser.add_argument(
+        "--simulate-download-failures",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Démonstration : fait échouer les N premières récupérations depuis S3",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -347,12 +423,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         run(
             args.input,
-            args.generate,
-            args.seed,
-            args.save,
-            policy,
-            args.simulate_insert_failures,
-            args.upload,
+            generate=args.generate,
+            seed=args.seed,
+            save=args.save,
+            policy=policy,
+            simulate_insert_failures=args.simulate_insert_failures,
+            upload=args.upload,
+            source=args.source,
+            simulate_download_failures=args.simulate_download_failures,
         )
     except PipelineError as error:
         print(f"\nERREUR : {error}", file=sys.stderr)

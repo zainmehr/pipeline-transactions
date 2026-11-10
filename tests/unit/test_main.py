@@ -33,3 +33,11 @@ def test_pipeline_avec_generation_sans_base(tmp_path, capsys):
     sortie = capsys.readouterr().out
     assert "transactions_003.csv généré" in sortie
     assert "Pipeline terminée avec succès" in sortie
+
+
+def test_source_inconnue_refusee(tmp_path, capsys):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(["--input", str(tmp_path), "--source", "ftp"])
+    assert "invalid choice" in capsys.readouterr().err
