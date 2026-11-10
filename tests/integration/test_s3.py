@@ -29,9 +29,9 @@ def test_envoi_et_lecture_des_metadonnees(s3, tmp_path):
     [path] = generate_files(tmp_path, nb_files=1)
     file_hash = compute_file_hash(path)
 
-    key = upload_file(client, config.bucket, path, file_hash)
+    key = upload_file(client, config.bucket, path.name, path.read_bytes(), file_hash)
 
-    assert key == object_key("transactions_001.csv")
+    assert key == object_key("transactions_001.csv", file_hash)
     assert list_keys(client, config.bucket) == [key]
     assert object_hash(client, config.bucket, key) == file_hash
     contenu = client.get_object(Bucket=config.bucket, Key=key)["Body"].read()
@@ -54,20 +54,31 @@ def test_pipeline_avec_envoi_vers_s3(s3, tmp_path, capsys):
     assert f"bucket {config.describe()} créé" in sortie
     assert sortie.count("envoyé vers s3://") == 3
     assert "vérification : 3/3 fichier(s) présent(s) et intègre(s)" in sortie
-    keys = list_keys(client, config.bucket)
-    assert keys == [object_key(f"transactions_00{i}.csv") for i in (1, 2, 3)]
-    for path in sorted(tmp_path.glob("*.csv")):
-        assert object_hash(client, config.bucket, object_key(path.name)) == compute_file_hash(path)
+    paths = sorted(tmp_path.glob("*.csv"))
+    keys = [object_key(path.name, compute_file_hash(path)) for path in paths]
+    assert sorted(list_keys(client, config.bucket)) == sorted(keys)
+    for path, key in zip(paths, keys, strict=True):
+        assert object_hash(client, config.bucket, key) == compute_file_hash(path)
 
 
-def test_renvoi_d_un_fichier_modifie(s3, tmp_path):
-    """Un fichier régénéré avec une autre graine remplace l'objet : le hash stocké suit."""
+def test_meme_nom_contenu_different_aucun_ecrasement(s3, tmp_path):
+    """Un fichier régénéré avec une autre graine porte le même nom : les deux versions
+    sont conservées, aucune ne peut en écraser une autre avant d'avoir été traitée."""
     config, client = s3
-    assert main(["--input", str(tmp_path), "--generate", "1", "--seed", "1", "--upload"]) == 0
-    assert main(["--input", str(tmp_path), "--generate", "1", "--seed", "2", "--upload"]) == 0
-    path = tmp_path / "transactions_001.csv"
-    assert object_hash(client, config.bucket, object_key(path.name)) == compute_file_hash(path)
-    assert len(list_keys(client, config.bucket)) == 1
+    args = ["--input", str(tmp_path), "--generate", "1", "--upload"]
+    assert main([*args, "--seed", "1"]) == 0
+    assert main([*args, "--seed", "2"]) == 0
+    keys = list_keys(client, config.bucket)
+    assert len(keys) == 2
+    assert all(key.endswith("/transactions_001.csv") for key in keys)
+
+
+def test_renvoi_du_meme_fichier_idempotent(s3, tmp_path):
+    config, client = s3
+    args = ["--input", str(tmp_path), "--generate", "2", "--upload"]
+    assert main(args) == 0
+    assert main(args) == 0
+    assert len(list_keys(client, config.bucket)) == 2
 
 
 def test_commande_list_s3(s3, tmp_path, capsys):
@@ -79,5 +90,6 @@ def test_commande_list_s3(s3, tmp_path, capsys):
 
     assert list_s3() == 0
     sortie = capsys.readouterr().out
-    assert f"s3://{config.bucket}/transactions/transactions_002.csv" in sortie
+    assert f"s3://{config.bucket}/transactions/" in sortie
+    assert "/transactions_002.csv" in sortie
     assert "2 fichier(s)" in sortie

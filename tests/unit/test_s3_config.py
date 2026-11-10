@@ -20,8 +20,10 @@ def test_description_sans_secret():
     assert "secret-tres-prive" not in S3Config(secret_key="secret-tres-prive").describe()
 
 
-def test_cle_de_l_objet():
-    assert object_key("transactions_001.csv") == f"{KEY_PREFIX}transactions_001.csv"
+def test_cle_de_l_objet_derivee_du_contenu():
+    empreinte = "ab" * 32
+    assert object_key("f.csv", empreinte) == f"{KEY_PREFIX}{'ab' * 8}/f.csv"
+    assert object_key("f.csv", "cd" * 32) != object_key("f.csv", empreinte)
 
 
 def test_list_s3_stockage_inaccessible(monkeypatch, capsys):

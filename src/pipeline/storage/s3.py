@@ -1,8 +1,11 @@
 """Accès au stockage objet compatible S3 (RustFS en local et en CI).
 
-Les fichiers CSV générés sont envoyés dans un bucket, sous le préfixe `transactions/`.
-Chaque objet porte en métadonnée l'empreinte SHA-256 de son contenu, ce qui permet de
-vérifier après l'envoi que le stockage contient exactement le fichier envoyé.
+Les fichiers CSV sont envoyés dans un bucket sous la clé
+`transactions/<16 premiers caractères de l'empreinte SHA-256>/<nom du fichier>`.
+La clé dépend du contenu : renvoyer le même fichier ne crée pas de doublon, et un fichier
+de même nom mais de contenu différent n'écrase jamais le précédent, même s'il n'a pas
+encore été traité. Chaque objet porte aussi son empreinte complète en métadonnée, ce qui
+permet de vérifier son intégrité et d'ignorer un fichier déjà traité sans le télécharger.
 """
 
 from __future__ import annotations
@@ -10,7 +13,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 import boto3
 from botocore.config import Config
@@ -23,6 +25,10 @@ HASH_METADATA = "sha256"
 
 class TransientS3Error(Exception):
     """Erreur S3 temporaire (service saturé ou indisponible) : elle mérite un retry."""
+
+
+class ObjectNotFoundError(Exception):
+    """L'objet demandé n'existe pas (ou plus) dans le bucket."""
 
 
 # Erreurs réseau (service arrêté, connexion coupée, délai dépassé) et erreurs 5xx.
@@ -58,9 +64,9 @@ class S3Config:
         return f"{self.endpoint_url}/{self.bucket}"
 
 
-def object_key(file_name: str) -> str:
-    """Clé de l'objet S3 correspondant à un fichier CSV."""
-    return f"{KEY_PREFIX}{file_name}"
+def object_key(file_name: str, file_hash: str) -> str:
+    """Clé de l'objet S3 correspondant à un fichier CSV, dérivée de son contenu."""
+    return f"{KEY_PREFIX}{file_hash[:16]}/{file_name}"
 
 
 def create_client(config: S3Config, timeout: int = 5):
@@ -108,14 +114,14 @@ def ensure_bucket(client, bucket: str) -> bool:
     return True
 
 
-def upload_file(client, bucket: str, path: Path, file_hash: str) -> str:
-    """Envoie un fichier dans le bucket et retourne la clé de l'objet créé."""
-    key = object_key(path.name)
+def upload_file(client, bucket: str, file_name: str, content: bytes, file_hash: str) -> str:
+    """Envoie le contenu d'un fichier dans le bucket et retourne la clé de l'objet créé."""
+    key = object_key(file_name, file_hash)
     try:
         client.put_object(
             Bucket=bucket,
             Key=key,
-            Body=path.read_bytes(),
+            Body=content,
             ContentType="text/csv",
             Metadata={HASH_METADATA: file_hash},
         )
@@ -123,6 +129,18 @@ def upload_file(client, bucket: str, path: Path, file_hash: str) -> str:
         _raise_if_transient(error)
         raise
     return key
+
+
+def download_object(client, bucket: str, key: str) -> bytes:
+    """Télécharge le contenu d'un objet du bucket."""
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+        return response["Body"].read()
+    except ClientError as error:
+        _raise_if_transient(error)
+        if error.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            raise ObjectNotFoundError(f"objet introuvable : s3://{bucket}/{key}") from error
+        raise
 
 
 def list_keys(client, bucket: str, prefix: str = KEY_PREFIX) -> list[str]:
