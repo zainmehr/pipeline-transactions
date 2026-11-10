@@ -39,6 +39,7 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 │   └── integration/           → tests d'intégration
 ├── sql/init/                  → scripts d'initialisation du conteneur PostgreSQL
 ├── docker-compose.yml         → base PostgreSQL locale
+├── Makefile                   → raccourcis (make pipeline, make test, ...)
 ├── .env.example               → modèle de configuration
 ├── data/                      → fichiers CSV générés (non versionnés)
 └── docs/screenshots/          → captures de la simulation d'échec
@@ -51,8 +52,26 @@ python3 -m venv .venv
 source .venv/bin/activate        # Windows : .venv\Scripts\activate
 pip install -e ".[dev]"
 cp .env.example .env
-docker compose up -d             # lance PostgreSQL (bases « pipeline » et « pipeline_test »)
 ```
+
+## Démarrage rapide
+
+```bash
+make pipeline
+```
+
+Cette commande unique démarre PostgreSQL (en attendant qu'il soit prêt), génère les CSV,
+les charge, les valide, les traite et insère les résultats en base. `make` seul affiche
+toutes les commandes disponibles :
+
+| Commande | Rôle |
+|---|---|
+| `make pipeline` | Pipeline complète (`FILES=10 SEED=7 make pipeline` pour changer les données) |
+| `make test` | Tous les tests, unitaires et intégration |
+| `make ci` | Reproduit la CI en local (style + tests) |
+| `make format` | Corrige automatiquement le style du code |
+| `make db-shell` | Terminal SQL sur la base |
+| `make db-reset` | Vide la base et la redémarre |
 
 ## Utilisation
 
@@ -92,36 +111,37 @@ Chaque fichier contient entre 5 et 10 transactions au format suivant :
 - **IBAN valides** : clé de contrôle modulo 97 conforme à la norme ISO 13616.
 - **Montants en `Decimal`** : aucune erreur d'arrondi liée aux nombres flottants.
 
-### Charger et traiter les fichiers CSV
+### La pipeline en détail
 
 ```bash
-run-pipeline --input data
+run-pipeline --input data --generate 5 --seed 42 --save
 ```
 
-La commande charge tous les fichiers `.csv` du dossier, valide chaque ligne, puis affiche :
+| Option | Rôle |
+|---|---|
+| `--input` | Dossier des fichiers CSV (défaut : `data`) |
+| `--generate N` | Génère N fichiers avant le traitement |
+| `--seed` | Graine de génération (défaut : 42) |
+| `--save` | Insère les résultats en base |
 
-- la somme des montants envoyés par `iban_origine` ;
-- la somme des montants envoyés par `banque_source` ;
-- la somme des montants reçus par `iban_destinataire` ;
-- les transactions flaggées (montant strictement supérieur à 5000).
+La pipeline s'exécute en quatre étapes affichées dans le terminal :
 
-Si un fichier est invalide, la commande affiche toutes les erreurs avec leur numéro de ligne
-et se termine avec le code retour `1`, ce qui fait échouer la CI.
+1. **Génération des CSV** (avec `--generate`).
+2. **Préparation de la base** (avec `--save`) : création du schéma s'il n'existe pas, puis
+   exclusion des fichiers déjà traités.
+3. **Chargement et traitement** : validation de tous les nouveaux fichiers, puis calcul des
+   sommes envoyées par `iban_origine`, envoyées par `banque_source` et reçues par
+   `iban_destinataire`, et flag des transactions de plus de 5000 (rapport affiché).
+4. **Insertion en base** (avec `--save`) : chaque fichier est inséré avec ses transactions
+   et ses sommes, dans une transaction SQL unique.
 
-### Insérer les résultats en base
+**Aucun double traitement.** Un fichier est identifié par le hash SHA-256 de son contenu.
+Un fichier déjà traité est ignoré, même renommé : la pipeline peut être relancée autant de
+fois que nécessaire sans jamais compter une transaction deux fois.
 
-```bash
-run-pipeline --input data --save
-```
-
-Le schéma est créé automatiquement s'il n'existe pas, puis chaque fichier est inséré avec
-ses transactions et ses sommes. Un fichier déjà inséré (même contenu) est refusé.
-
-Consulter la base :
-
-```bash
-docker compose exec postgres psql -U pipeline -d pipeline
-```
+**Tout ou rien.** Tous les nouveaux fichiers sont validés avant la première insertion. Si un
+seul est invalide, la commande affiche toutes les erreurs avec leur numéro de ligne, n'insère
+rien et se termine avec le code retour `1`, ce qui fait échouer la CI.
 
 ### Architecture du traitement
 
@@ -180,13 +200,16 @@ pytest --cov=pipeline --cov-report=term-missing  # avec couverture
 ruff check . && ruff format --check .            # lint et formatage
 ```
 
-Les tests d'intégration utilisent la base `pipeline_test`, vidée avant chaque test. Si
+Les tests d'intégration (`tests/integration/`) couvrent la base seule (`test_database.py`)
+et la pipeline complète de bout en bout (`test_pipeline.py`) : valeurs attendues calculées à
+la main, données générées, relance sans doublon, ajout d'un nouveau fichier, fichier
+invalide. Ils utilisent la base `pipeline_test`, vidée avant chaque test. Si
 PostgreSQL n'est pas lancé, ils sont ignorés en local ; en CI (`REQUIRE_DB=1`), ils échouent.
 
 Reproduire la CI en local avant de pousser :
 
 ```bash
-ruff check . && ruff format --check . && pytest && generate-csv --files 5 && run-pipeline
+make ci
 ```
 
 ## Intégration continue
@@ -196,8 +219,9 @@ Elle comporte deux jobs :
 
 1. **Qualité et tests unitaires** : lint, formatage, tests unitaires avec couverture.
 2. **Base de données et tests d'intégration** (lancé seulement si le premier réussit) :
-   démarre un service PostgreSQL, exécute les tests d'intégration, génère les CSV puis
-   les insère en base avec `run-pipeline --save`.
+   démarre un service PostgreSQL, exécute les tests d'intégration, lance la pipeline
+   complète, la relance pour vérifier l'absence de doublons, puis contrôle directement en
+   SQL le nombre de fichiers en base et la cohérence des sommes.
 
 ## Workflow Git
 
@@ -212,8 +236,8 @@ Elle comporte deux jobs :
 - [x] 1.1 Génération des données CSV
 - [x] 1.2 Chargement et traitement des données
 - [x] 1.3 Base de données relationnelle
-- [ ] 1.4 Pipeline complète
-- [ ] 1.5 Tests d'intégration automatiques
+- [x] 1.4 Pipeline complète
+- [x] 1.5 Tests d'intégration automatiques
 - [ ] 1.6 Simulation d'un échec de pipeline
 - [ ] 1.7 Retry lors de l'insertion en base
 

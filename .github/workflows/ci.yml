@@ -78,8 +78,22 @@ jobs:
       - name: Tests d'intégration
         run: pytest -m integration -v
 
-      - name: Génération des CSV
-        run: generate-csv --output data --files 5 --seed 42
+      - name: Pipeline complète (génération, traitement, insertion)
+        run: run-pipeline --input data --generate 5 --seed 42 --save
 
-      - name: Traitement et insertion en base
-        run: run-pipeline --input data --save
+      - name: Relance de la pipeline (aucun doublon attendu)
+        run: run-pipeline --input data --generate 5 --seed 42 --save
+
+      - name: Vérification du contenu de la base
+        env:
+          PGPASSWORD: pipeline
+        run: |
+          fichiers=$(psql -h localhost -U pipeline -d pipeline -tAc "SELECT COUNT(*) FROM processed_files")
+          echo "Fichiers en base : $fichiers"
+          test "$fichiers" -eq 5
+          ecarts=$(psql -h localhost -U pipeline -d pipeline -tAc "
+            SELECT COUNT(*) FROM total_sent_by_iban t
+            FULL JOIN v_total_sent_by_iban v USING (iban)
+            WHERE t.total IS DISTINCT FROM v.total")
+          echo "Écarts entre sommes stockées et recalculées : $ecarts"
+          test "$ecarts" -eq 0
