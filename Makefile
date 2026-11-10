@@ -1,6 +1,6 @@
 # Raccourcis du projet. `make` ou `make help` affiche la liste des commandes.
 .DEFAULT_GOAL := help
-.PHONY: help install up db-up db-down db-reset db-shell s3-ls pipeline demo-retry demo-retry-echec demo-panne lint format test test-unit ci clean
+.PHONY: help install up db-up db-down db-reset db-shell s3-ls pipeline demo-retry demo-retry-echec demo-panne demo-retry-s3 demo-retry-s3-echec demo-panne-s3 lint format test test-unit ci clean
 
 FILES ?= 5
 SEED  ?= 42
@@ -33,8 +33,8 @@ s3-ls: ## Liste les fichiers présents dans le bucket S3
 db-shell: ## Ouvre un terminal SQL sur la base
 	docker compose exec postgres psql -U pipeline -d pipeline
 
-pipeline: up ## Pipeline complète : services, génération, envoi S3, traitement, insertion
-	run-pipeline --input data --generate $(FILES) --seed $(SEED) --upload --save
+pipeline: up ## Pipeline complète : génération, envoi S3, lecture depuis S3, traitement, insertion
+	run-pipeline --input data --generate $(FILES) --seed $(SEED) --upload --source s3 --save
 
 demo-retry: up ## Démo : 2 pannes simulées à l'insertion, puis succès
 	run-pipeline --input data/demo-retry --generate 3 --seed $$(date +%s) --save --simulate-insert-failures 2
@@ -46,6 +46,18 @@ demo-panne: up ## Démo réelle : PostgreSQL arrêté puis redémarré pendant l
 	docker compose stop postgres
 	(sleep 5 && docker compose start postgres) &
 	run-pipeline --input data/demo-panne --generate 2 --seed $$(date +%s) --save --max-attempts 5
+
+demo-retry-s3: up ## Démo : 2 pannes simulées à la récupération depuis S3, puis succès
+	run-pipeline --input data/demo-s3 --generate 3 --seed $$(date +%s) --upload --source s3 --save --simulate-download-failures 2
+
+demo-retry-s3-echec: up ## Démo : fichier S3 inaccessible, arrêt propre après 3 tentatives
+	run-pipeline --input data/demo-s3-echec --generate 3 --seed $$(date +%s) --upload --source s3 --save --simulate-download-failures 10
+
+demo-panne-s3: up ## Démo réelle : RustFS arrêté puis redémarré pendant la récupération
+	run-pipeline --input data/demo-panne-s3 --generate 2 --seed $$(date +%s) --upload
+	docker compose stop rustfs
+	(sleep 5 && docker compose start rustfs) &
+	run-pipeline --source s3 --save --max-attempts 5
 
 lint: ## Vérifie le style du code
 	ruff check .

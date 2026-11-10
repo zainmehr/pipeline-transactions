@@ -100,11 +100,11 @@ jobs:
       - name: Tests d'intégration
         run: pytest -m integration -v
 
-      - name: Pipeline complète (génération, envoi S3, traitement, insertion)
-        run: run-pipeline --input data --generate 5 --seed 42 --upload --save
+      - name: Pipeline complète (génération, envoi S3, lecture depuis S3, insertion)
+        run: run-pipeline --input data --generate 5 --seed 42 --upload --source s3 --save
 
       - name: Relance de la pipeline (aucun doublon attendu)
-        run: run-pipeline --input data --generate 5 --seed 42 --upload --save
+        run: run-pipeline --input data --generate 5 --seed 42 --upload --source s3 --save
 
       - name: Vérification du contenu du bucket S3
         run: |
@@ -140,13 +140,30 @@ jobs:
       - name: Reprise après l'arrêt
         run: run-pipeline --input data-echec --save
 
-      - name: Vérification finale de la base (aucun doublon)
+      - name: Pannes temporaires à la récupération S3 (retry puis succès)
+        run: run-pipeline --input data-s3-retry --generate 3 --seed 2001 --upload --source s3 --save --simulate-download-failures 2 --retry-delay 0.5
+
+      - name: Fichier S3 inaccessible (arrêt propre attendu)
+        run: |
+          if run-pipeline --input data-s3-echec --generate 3 --seed 2002 --upload --source s3 --save --simulate-download-failures 10 --retry-delay 0.2; then
+            echo "La pipeline aurait dû s'arrêter : le fichier est resté inaccessible"
+            exit 1
+          fi
+          echo "Arrêt attendu : le fichier est resté inaccessible après 3 tentatives"
+
+      - name: Reprise de la récupération depuis S3
+        run: run-pipeline --source s3 --save
+
+      - name: Vérification finale du bucket et de la base (aucun doublon)
         env:
           PGPASSWORD: pipeline
         run: |
+          objets=$(list-s3 | grep -c '^s3://')
+          echo "Objets dans le bucket : $objets (5 + 3 + 3)"
+          test "$objets" -eq 11
           fichiers=$(psql -h localhost -U pipeline -d pipeline -tAc "SELECT COUNT(*) FROM processed_files")
-          echo "Fichiers en base : $fichiers (5 + 3 après retry + 3 après reprise)"
-          test "$fichiers" -eq 11
+          echo "Fichiers en base : $fichiers (5 + 3 + 3 insertion + 3 + 3 récupération S3)"
+          test "$fichiers" -eq 17
           ecarts=$(psql -h localhost -U pipeline -d pipeline -tAc "
             SELECT COUNT(*) FROM total_sent_by_iban t
             FULL JOIN v_total_sent_by_iban v USING (iban)

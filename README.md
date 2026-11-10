@@ -8,7 +8,7 @@ Pipeline data automatisée allant de la génération de transactions financière
 jusqu'à leur insertion dans une base de données relationnelle, intégrée à une démarche CI/CD :
 
 ```
-Génération CSV → Stockage S3 → Chargement → Validation → Traitement → Base de données
+Génération CSV → Stockage S3 → Récupération → Chargement → Validation → Traitement → Base de données
 ```
 
 ## Stack technique
@@ -29,7 +29,7 @@ Génération CSV → Stockage S3 → Chargement → Validation → Traitement �
 ├── .github/workflows/ci.yml   → pipeline CI
 ├── src/pipeline/
 │   ├── generation/            → génération des fichiers CSV
-│   ├── loading/               → chargement des fichiers
+│   ├── loading/               → récupération (local ou S3) et chargement des fichiers
 │   ├── processing/            → traitements (fonctions pures)
 │   ├── storage/               → schéma SQL, insertion en base et stockage S3
 │   ├── models.py              → modèles de données partagés (Transaction, ...)
@@ -64,7 +64,8 @@ make pipeline
 
 Cette commande unique démarre PostgreSQL et le stockage S3 (en attendant qu'ils soient
 prêts), génère les CSV, les envoie dans le bucket S3 et vérifie leur présence, puis les
-charge, les valide, les traite et insère les résultats en base. `make` seul affiche
+récupère depuis le bucket, les charge, les valide, les traite et insère les résultats en
+base. Le traitement ne lit aucun fichier sur le disque local. `make` seul affiche
 toutes les commandes disponibles :
 
 | Commande | Rôle |
@@ -80,6 +81,9 @@ toutes les commandes disponibles :
 | `make demo-retry` | Démo : 2 pannes simulées à l'insertion, puis succès |
 | `make demo-retry-echec` | Démo : pannes répétées, arrêt après 3 tentatives |
 | `make demo-panne` | Démo réelle : PostgreSQL arrêté puis redémarré pendant la pipeline |
+| `make demo-retry-s3` | Démo : 2 pannes simulées à la récupération depuis S3, puis succès |
+| `make demo-retry-s3-echec` | Démo : fichier S3 inaccessible, arrêt propre après 3 tentatives |
+| `make demo-panne-s3` | Démo réelle : RustFS arrêté puis redémarré pendant la récupération |
 
 ## Utilisation
 
@@ -122,7 +126,7 @@ Chaque fichier contient entre 5 et 10 transactions au format suivant :
 ### La pipeline en détail
 
 ```bash
-run-pipeline --input data --generate 5 --seed 42 --upload --save
+run-pipeline --input data --generate 5 --seed 42 --upload --source s3 --save
 ```
 
 | Option | Rôle |
@@ -131,22 +135,26 @@ run-pipeline --input data --generate 5 --seed 42 --upload --save
 | `--generate N` | Génère N fichiers avant le traitement |
 | `--seed` | Graine de génération (défaut : 42) |
 | `--upload` | Envoie les CSV dans le bucket S3 et vérifie leur présence |
+| `--source` | Origine des fichiers à traiter : `local` (défaut) ou `s3` |
 | `--save` | Insère les résultats en base |
-| `--max-attempts` | Nombre maximal de tentatives par accès à la base (défaut : 3) |
+| `--max-attempts` | Nombre maximal de tentatives par accès à la base ou à S3 (défaut : 3) |
 | `--retry-delay` | Attente avant la 2e tentative, doublée ensuite (défaut : 1 s) |
 | `--simulate-insert-failures N` | Démonstration : fait échouer les N premières tentatives d'insertion |
+| `--simulate-download-failures N` | Démonstration : fait échouer les N premières récupérations depuis S3 |
 
-La pipeline s'exécute en cinq étapes affichées dans le terminal :
+La pipeline s'exécute en six étapes affichées dans le terminal :
 
 1. **Génération des CSV** (avec `--generate`).
 2. **Envoi vers le stockage S3** (avec `--upload`) : création du bucket s'il n'existe pas,
    envoi des fichiers, puis vérification de leur présence et de leur intégrité.
-3. **Préparation de la base** (avec `--save`) : création du schéma s'il n'existe pas, puis
-   exclusion des fichiers déjà traités.
-4. **Chargement et traitement** : validation de tous les nouveaux fichiers, puis calcul des
+3. **Préparation de la base** (avec `--save`) : création du schéma s'il n'existe pas, et
+   lecture des empreintes des fichiers déjà traités.
+4. **Récupération des fichiers** depuis le bucket S3 (`--source s3`) ou le dossier local,
+   en excluant les fichiers déjà traités.
+5. **Chargement et traitement** : validation de tous les nouveaux fichiers, puis calcul des
    sommes envoyées par `iban_origine`, envoyées par `banque_source` et reçues par
    `iban_destinataire`, et flag des transactions de plus de 5000 (rapport affiché).
-5. **Insertion en base** (avec `--save`) : chaque fichier est inséré avec ses transactions
+6. **Insertion en base** (avec `--save`) : chaque fichier est inséré avec ses transactions
    et ses sommes, dans une transaction SQL unique.
 
 **Aucun double traitement.** Un fichier est identifié par le hash SHA-256 de son contenu.
@@ -173,14 +181,61 @@ identifiants `S3_ACCESS_KEY` et `S3_SECRET_KEY` du fichier `.env`.
 L'étape d'envoi, définie dans `src/pipeline/storage/s3.py` :
 
 1. **crée le bucket** s'il n'existe pas (l'opération est idempotente) ;
-2. **envoie chaque fichier** sous la clé `transactions/<nom du fichier>`, avec en
-   métadonnée l'empreinte SHA-256 de son contenu ;
+2. **envoie chaque fichier** sous la clé `transactions/<début de l'empreinte>/<nom du fichier>`,
+   avec en métadonnée l'empreinte SHA-256 complète de son contenu ;
 3. **vérifie** que chaque fichier est présent dans le bucket et que l'empreinte stockée
    correspond à celle du fichier envoyé. Sinon, la pipeline s'arrête en erreur.
+
+**La clé dépend du contenu.** Renvoyer le même fichier ne crée pas de doublon dans le
+bucket, et un fichier de même nom mais de contenu différent n'écrase jamais le précédent,
+même si celui-ci n'a pas encore été traité : aucune donnée ne peut être perdue.
 
 Les accès au stockage S3 bénéficient du même mécanisme de retry que la base : un service
 en cours de démarrage ou momentanément indisponible ne fait pas échouer la pipeline.
 `make s3-ls` (ou la commande `list-s3`) affiche le contenu du bucket.
+
+### Lecture depuis le stockage S3
+
+Avec `--source s3`, les fichiers à traiter sont récupérés depuis le bucket, et non plus
+depuis le disque local (`src/pipeline/loading/sources.py`) :
+
+```
+S3 ──> liste des fichiers ──> pour chaque fichier :
+         empreinte déjà traitée ? ──oui──> ignoré, sans téléchargement
+         sinon : téléchargement ──> contrôle d'intégrité ──> chargement ──> traitement ──> base
+```
+
+- **Pas de double traitement.** L'empreinte enregistrée sur l'objet est comparée à la
+  table `processed_files` avant tout téléchargement : un fichier déjà traité n'est même pas
+  téléchargé. Après téléchargement, l'empreinte est recalculée sur le contenu reçu.
+- **Contrôle d'intégrité.** Si le contenu reçu ne correspond pas à l'empreinte enregistrée
+  (transfert corrompu), la récupération est considérée comme ratée et réessayée.
+- **Traçabilité.** L'URI complète de l'objet (`s3://bucket/transactions/.../fichier.csv`)
+  est enregistrée dans `processed_files`.
+- **Un seul format de chargement.** Le décodage et la validation (`parse_csv`) prennent un
+  contenu en mémoire : ils sont identiques quelle que soit la source.
+
+### Retry lors de la récupération depuis S3
+
+Chaque accès au bucket (liste, métadonnées, téléchargement) utilise le mécanisme de retry :
+l'échec est **détecté** et **affiché**, la pipeline **attend** avant de **réessayer**,
+jusqu'au **nombre maximal** de tentatives. Si un fichier reste inaccessible, la pipeline
+**s'arrête proprement** : comme la récupération a lieu avant toute insertion, aucune
+donnée n'est insérée, et une relance reprend l'ensemble du traitement.
+
+```
+  ATTENTION : tentative 1/3 de « récupération de transactions_001.csv » échouée :
+              TransientS3Error: ... Nouvelle tentative dans 1 s
+  ÉCHEC : tentative 3/3 de « récupération de transactions_001.csv » échouée : ...
+
+ERREUR : stockage S3 inaccessible (http://localhost:9000/transactions) : ...
+Le traitement est arrêté : aucune donnée n'a été insérée.
+```
+
+Sont réessayées les erreurs réseau (service arrêté, connexion coupée, délai dépassé), les
+erreurs 5xx du service et les contenus corrompus. Un fichier supprimé du bucket ou des
+identifiants refusés arrêtent la pipeline immédiatement. La panne peut être simulée
+(`--simulate-download-failures N`, `make demo-retry-s3`) ou réelle (`make demo-panne-s3`).
 
 ### Retry en cas de problème temporaire
 
@@ -219,10 +274,11 @@ redémarré 5 secondes plus tard, pendant que la pipeline réessaie de s'y conne
 ### Architecture du traitement
 
 ```
-Fichier CSV ──> loading (I/O) ──> validation (pure) ──> processing (pur) ──> résultats
+Disque ou S3 ──> loading (I/O) ──> parse_csv + validation (purs) ──> processing (pur) ──> résultats
 ```
 
-- **`loading/`** : lecture des fichiers uniquement, aucune logique métier.
+- **`loading/`** : récupération des fichiers (disque local ou S3) et décodage du CSV,
+  aucune logique métier.
 - **`validation.py`** : conversion d'une ligne en `Transaction` et contrôle du format
   (colonnes, date ISO 8601, montant positif à 2 décimales, IBAN valide et cohérent avec
   le pays, émetteur différent du destinataire). Toutes les erreurs d'une ligne sont
@@ -279,6 +335,9 @@ la main, données générées, relance sans doublon, ajout d'un nouveau fichier,
 invalide. `test_retry_pipeline.py` couvre les pannes simulées, l'arrêt après le nombre
 maximal de tentatives, la reprise et l'absence de doublons. `test_s3.py` couvre la
 création du bucket, l'envoi, la vérification d'intégrité et la commande `list-s3`.
+`test_s3_source.py` couvre la lecture depuis S3 : fichiers déjà traités ignorés sans
+téléchargement, contenu altéré, pannes simulées puis succès, arrêt propre et reprise,
+traitement complet sans aucun fichier local.
 
 Les tests utilisent la base `pipeline_test`, vidée avant chaque test, et un bucket S3
 temporaire propre à chaque test, supprimé ensuite. Si un service n'est pas lancé, ses tests
@@ -298,11 +357,11 @@ Elle comporte deux jobs :
 1. **Qualité et tests unitaires** : lint, formatage, tests unitaires avec couverture.
 2. **Base de données et tests d'intégration** (lancé seulement si le premier réussit) :
    démarre PostgreSQL et RustFS, exécute les tests d'intégration, lance la pipeline
-   complète avec envoi vers S3, la relance pour vérifier l'absence de doublons, contrôle
-   le contenu du bucket, puis contrôle directement en SQL le nombre de fichiers en base et
-   la cohérence des sommes. Il simule ensuite des
-   pannes temporaires (retry puis succès), des pannes persistantes (arrêt attendu), une
-   reprise après l'arrêt, et vérifie à nouveau la base.
+   complète (envoi vers S3 puis lecture depuis S3), la relance pour vérifier l'absence de
+   doublons, contrôle le contenu du bucket, puis contrôle directement en SQL le nombre de
+   fichiers en base et la cohérence des sommes. Il simule ensuite, à l'insertion puis à la
+   récupération depuis S3, des pannes temporaires (retry puis succès), des pannes
+   persistantes (arrêt attendu) et une reprise, et vérifie à nouveau le bucket et la base.
 
 ## Workflow Git
 
@@ -325,8 +384,8 @@ Elle comporte deux jobs :
 ### Niveau 2 — Stockage S3
 - [x] 2.1 Stockage des fichiers dans un service S3
 - [x] 2.2 Upload automatique dans le S3
-- [ ] 2.3 Lecture des données depuis le S3
-- [ ] 2.4 Retry lors de la récupération depuis le S3
+- [x] 2.3 Lecture des données depuis le S3
+- [x] 2.4 Retry lors de la récupération depuis le S3
 
 ### Niveau 3 — Améliorations
 - [ ] Option à choisir
