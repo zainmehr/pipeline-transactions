@@ -25,3 +25,11 @@ def test_pipeline_echoue_sans_fichier(tmp_path, capsys):
 def test_pipeline_echoue_si_dossier_absent(tmp_path, capsys):
     assert main(["--input", str(tmp_path / "absent")]) == 1
     assert "Dossier introuvable" in capsys.readouterr().err
+
+
+def test_pipeline_avec_generation_sans_base(tmp_path, capsys):
+    assert main(["--input", str(tmp_path / "data"), "--generate", "3", "--seed", "7"]) == 0
+    assert len(list((tmp_path / "data").glob("*.csv"))) == 3
+    sortie = capsys.readouterr().out
+    assert "transactions_003.csv généré" in sortie
+    assert "Pipeline terminée avec succès" in sortie

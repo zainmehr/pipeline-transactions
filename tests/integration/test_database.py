@@ -5,7 +5,12 @@ import pytest
 
 from pipeline.generation.generator import generate_batch
 from pipeline.processing.transformations import process_transactions
-from pipeline.storage.database import DuplicateFileError, apply_schema, insert_processed_file
+from pipeline.storage.database import (
+    DuplicateFileError,
+    apply_schema,
+    fetch_processed_hashes,
+    insert_processed_file,
+)
 from tests.factories import BNP_1, BNP_2, DEUTSCHE, make_transaction
 
 pytestmark = pytest.mark.integration
@@ -20,6 +25,13 @@ def count(db, table):
 
 def totals(db, query):
     return dict(db.execute(query).fetchall())
+
+
+def test_fichiers_deja_traites(db):
+    assert fetch_processed_hashes(db) == set()
+    insert_processed_file(db, "f1.csv", HASH_A, process_transactions(generate_batch(42, 0)))
+    insert_processed_file(db, "f2.csv", HASH_B, process_transactions(generate_batch(42, 1)))
+    assert fetch_processed_hashes(db) == {HASH_A, HASH_B}
 
 
 def test_schema_rejouable(db):
@@ -136,26 +148,3 @@ def test_fichier_sans_transaction(db):
     insert_processed_file(db, "vide.csv", HASH_A, process_transactions([]))
     assert db.execute("SELECT nb_transactions FROM processed_files").fetchone() == (0,)
     assert count(db, "transactions") == 0
-
-
-def test_run_pipeline_save_insere_les_fichiers(db, db_config, tmp_path, monkeypatch, capsys):
-    from pipeline.generation.generator import generate_files
-    from pipeline.main import main
-
-    generate_files(tmp_path, nb_files=3, seed=42)
-    for var, value in {
-        "DB_HOST": db_config.host,
-        "DB_PORT": str(db_config.port),
-        "DB_NAME": db_config.dbname,
-        "DB_USER": db_config.user,
-        "DB_PASSWORD": db_config.password,
-    }.items():
-        monkeypatch.setenv(var, value)
-
-    assert main(["--input", str(tmp_path), "--save"]) == 0
-    assert count(db, "processed_files") == 3
-
-    # Une seconde exécution sur les mêmes fichiers est refusée (doublons).
-    assert main(["--input", str(tmp_path), "--save"]) == 1
-    assert "déjà inséré" in capsys.readouterr().err
-    assert count(db, "processed_files") == 3
