@@ -46,3 +46,18 @@ def db(db_session):
     """Connexion à une base vide."""
     db_session.execute(f"TRUNCATE {TABLES} RESTART IDENTITY CASCADE")
     return db_session
+
+
+@pytest.fixture
+def pipeline_env(db, db_config, monkeypatch):
+    """Base vide + variables d'environnement pointant vers la base de test,
+    pour exécuter la pipeline complète comme en ligne de commande."""
+    for var, value in {
+        "DB_HOST": db_config.host,
+        "DB_PORT": str(db_config.port),
+        "DB_NAME": db_config.dbname,
+        "DB_USER": db_config.user,
+        "DB_PASSWORD": db_config.password,
+    }.items():
+        monkeypatch.setenv(var, value)
+    return db
