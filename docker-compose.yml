@@ -18,5 +18,22 @@ services:
       timeout: 3s
       retries: 15
 
+  # Stockage objet compatible S3. API sur le port 9000, console web sur le port 9001.
+  rustfs:
+    image: rustfs/rustfs:1.0.0
+    container_name: pipeline-rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-pipeline}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-pipeline-secret}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfsdata:/data
+
 volumes:
   pgdata:
+  rustfsdata:
