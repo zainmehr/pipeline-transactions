@@ -282,7 +282,7 @@ Elle comporte deux jobs :
 - [x] 1.3 Base de données relationnelle
 - [x] 1.4 Pipeline complète
 - [x] 1.5 Tests d'intégration automatiques
-- [ ] 1.6 Simulation d'un échec de pipeline
+- [x] 1.6 Simulation d'un échec de pipeline ([détail](docs/simulation-echec.md))
 - [x] 1.7 Retry lors de l'insertion en base
 
 ### Niveau 2 — Stockage S3
