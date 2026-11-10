@@ -55,3 +55,15 @@ def test_options_de_retry_invalides(tmp_path, capsys):
     with pytest.raises(SystemExit):
         main(["--input", str(tmp_path), "--max-attempts", "0"])
     assert "max_attempts" in capsys.readouterr().err
+
+
+def test_s3_inaccessible_retry_puis_arret_propre(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("S3_ENDPOINT_URL", "http://127.0.0.1:1")  # aucun service S3 ici
+    args = ["--input", str(tmp_path), "--generate", "1", "--upload"]
+
+    code = main([*args, "--max-attempts", "2", "--retry-delay", "0"])
+
+    assert code == 1
+    sortie = capsys.readouterr()
+    assert "tentative 1/2 de « connexion au stockage S3 »" in sortie.out
+    assert "stockage S3 inaccessible" in sortie.err
