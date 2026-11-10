@@ -1,3 +1,4 @@
+from pipeline.generation.generator import generate_files
 from pipeline.loading.csv_loader import compute_file_hash
 from pipeline.main import main
 from pipeline.storage.database import DatabaseConfig, load_schema
@@ -34,11 +35,23 @@ def test_hash_depend_du_contenu_et_pas_du_nom(tmp_path):
     assert len(compute_file_hash(a)) == 64
 
 
-def test_save_echoue_proprement_si_base_inaccessible(tmp_path, monkeypatch, capsys):
-    from pipeline.generation.generator import generate_files
-
+def test_base_inaccessible_retry_puis_arret_propre(tmp_path, monkeypatch, capsys):
     generate_files(tmp_path, nb_files=1)
     monkeypatch.setenv("DB_HOST", "127.0.0.1")
     monkeypatch.setenv("DB_PORT", "1")  # aucun serveur n'écoute sur ce port
-    assert main(["--input", str(tmp_path), "--save"]) == 1
-    assert "base de données inaccessible" in capsys.readouterr().err
+
+    code = main(["--input", str(tmp_path), "--save", "--max-attempts", "2", "--retry-delay", "0"])
+
+    assert code == 1
+    sortie = capsys.readouterr()
+    assert "tentative 1/2" in sortie.out
+    assert "base de données inaccessible" in sortie.err
+    assert "après 2 tentative(s)" in sortie.err
+
+
+def test_options_de_retry_invalides(tmp_path, capsys):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(["--input", str(tmp_path), "--max-attempts", "0"])
+    assert "max_attempts" in capsys.readouterr().err

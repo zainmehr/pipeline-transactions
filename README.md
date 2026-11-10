@@ -33,6 +33,7 @@ Génération CSV → Chargement → Validation → Traitement → Base de donné
 │   ├── storage/               → schéma SQL et insertion en base
 │   ├── models.py              → modèles de données partagés (Transaction, ...)
 │   ├── validation.py          → validation des lignes CSV (fonctions pures)
+│   ├── retry.py               → mécanisme de nouvelle tentative (retry)
 │   └── main.py                → point d'entrée de la pipeline
 ├── tests/
 │   ├── unit/                  → tests unitaires
@@ -72,6 +73,9 @@ toutes les commandes disponibles :
 | `make format` | Corrige automatiquement le style du code |
 | `make db-shell` | Terminal SQL sur la base |
 | `make db-reset` | Vide la base et la redémarre |
+| `make demo-retry` | Démo : 2 pannes simulées à l'insertion, puis succès |
+| `make demo-retry-echec` | Démo : pannes répétées, arrêt après 3 tentatives |
+| `make demo-panne` | Démo réelle : PostgreSQL arrêté puis redémarré pendant la pipeline |
 
 ## Utilisation
 
@@ -123,6 +127,9 @@ run-pipeline --input data --generate 5 --seed 42 --save
 | `--generate N` | Génère N fichiers avant le traitement |
 | `--seed` | Graine de génération (défaut : 42) |
 | `--save` | Insère les résultats en base |
+| `--max-attempts` | Nombre maximal de tentatives par accès à la base (défaut : 3) |
+| `--retry-delay` | Attente avant la 2e tentative, doublée ensuite (défaut : 1 s) |
+| `--simulate-insert-failures N` | Démonstration : fait échouer les N premières tentatives d'insertion |
 
 La pipeline s'exécute en quatre étapes affichées dans le terminal :
 
@@ -142,6 +149,40 @@ fois que nécessaire sans jamais compter une transaction deux fois.
 **Tout ou rien.** Tous les nouveaux fichiers sont validés avant la première insertion. Si un
 seul est invalide, la commande affiche toutes les erreurs avec leur numéro de ligne, n'insère
 rien et se termine avec le code retour `1`, ce qui fait échouer la CI.
+
+### Retry en cas de problème temporaire
+
+Chaque accès à la base (connexion et préparation, puis insertion de chaque fichier) est
+réessayé en cas d'erreur temporaire : base indisponible, connexion perdue, conflit de
+transaction. Le mécanisme, défini dans `src/pipeline/retry.py` :
+
+1. **détecte l'échec** et affiche l'erreur rencontrée avec le numéro de la tentative ;
+2. **attend avant de réessayer**, avec un délai qui double à chaque échec (1 s, 2 s, 4 s...) ;
+3. **effectue plusieurs tentatives**, jusqu'à un **nombre maximal** (`--max-attempts`) ;
+4. **arrête la pipeline** au-delà, avec un message clair et le code retour `1`.
+
+```
+  ATTENTION : tentative 1/3 de « insertion de transactions_001.csv » échouée :
+              OperationalError: connexion perdue. Nouvelle tentative dans 1 s
+  ATTENTION : tentative 2/3 de « insertion de transactions_001.csv » échouée : ...
+  transactions_001.csv inséré (id=1, 8 transactions)
+```
+
+**Seules les erreurs temporaires sont réessayées.** Une donnée invalide ou un fichier déjà
+traité ne se résoudra pas en attendant : ces erreurs sont traitées immédiatement.
+
+**Un retry ne crée jamais de doublon.** L'insertion d'un fichier est atomique : une panne en
+cours d'insertion annule tout, et la tentative suivante repart de zéro. Si une tentative a
+réussi mais que sa confirmation a été perdue, la suivante trouve le hash du fichier dans
+`processed_files` et le fichier est ignoré au lieu d'être compté deux fois.
+
+**Reprise après arrêt.** Les fichiers insérés avant l'arrêt restent en base : relancer la
+pipeline ignore ces fichiers et reprend avec les suivants.
+
+**Simulation.** L'option `--simulate-insert-failures N` provoque une panne juste avant la
+validation de la transaction SQL, au pire moment possible, pour démontrer à la fois le retry
+et l'atomicité. `make demo-panne` provoque une vraie panne : PostgreSQL est arrêté puis
+redémarré 5 secondes plus tard, pendant que la pipeline réessaie de s'y connecter.
 
 ### Architecture du traitement
 
@@ -203,7 +244,8 @@ ruff check . && ruff format --check .            # lint et formatage
 Les tests d'intégration (`tests/integration/`) couvrent la base seule (`test_database.py`)
 et la pipeline complète de bout en bout (`test_pipeline.py`) : valeurs attendues calculées à
 la main, données générées, relance sans doublon, ajout d'un nouveau fichier, fichier
-invalide. Ils utilisent la base `pipeline_test`, vidée avant chaque test. Si
+invalide. `test_retry_pipeline.py` couvre les pannes simulées, l'arrêt après le nombre
+maximal de tentatives, la reprise et l'absence de doublons. Ils utilisent la base `pipeline_test`, vidée avant chaque test. Si
 PostgreSQL n'est pas lancé, ils sont ignorés en local ; en CI (`REQUIRE_DB=1`), ils échouent.
 
 Reproduire la CI en local avant de pousser :
@@ -221,7 +263,9 @@ Elle comporte deux jobs :
 2. **Base de données et tests d'intégration** (lancé seulement si le premier réussit) :
    démarre un service PostgreSQL, exécute les tests d'intégration, lance la pipeline
    complète, la relance pour vérifier l'absence de doublons, puis contrôle directement en
-   SQL le nombre de fichiers en base et la cohérence des sommes.
+   SQL le nombre de fichiers en base et la cohérence des sommes. Il simule ensuite des
+   pannes temporaires (retry puis succès), des pannes persistantes (arrêt attendu), une
+   reprise après l'arrêt, et vérifie à nouveau la base.
 
 ## Workflow Git
 
@@ -239,7 +283,7 @@ Elle comporte deux jobs :
 - [x] 1.4 Pipeline complète
 - [x] 1.5 Tests d'intégration automatiques
 - [ ] 1.6 Simulation d'un échec de pipeline
-- [ ] 1.7 Retry lors de l'insertion en base
+- [x] 1.7 Retry lors de l'insertion en base
 
 ### Niveau 2 — Stockage S3
 - [ ] 2.1 Stockage des fichiers dans un service S3
