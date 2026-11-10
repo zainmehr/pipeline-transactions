@@ -1,7 +1,7 @@
 import pytest
 
 from pipeline.generation.generator import generate_batch, generate_files
-from pipeline.loading.csv_loader import InvalidCSVError, list_csv_files, load_csv
+from pipeline.loading.csv_loader import InvalidCSVError, list_csv_files, load_csv, parse_csv
 from pipeline.models import CSV_COLUMNS
 from tests.factories import make_transaction
 
@@ -78,3 +78,18 @@ def test_list_csv_files_trie_et_filtre(tmp_path):
 def test_list_csv_files_dossier_inexistant(tmp_path):
     with pytest.raises(FileNotFoundError):
         list_csv_files(tmp_path / "absent")
+
+
+def test_parse_csv_depuis_un_contenu_en_memoire():
+    contenu = (HEADER + "\n" + csv_line(make_transaction()) + "\n").encode("utf-8")
+    assert parse_csv(contenu, "s3://bucket/transactions/f.csv") == [make_transaction()]
+
+
+def test_parse_csv_erreur_nomme_la_source():
+    with pytest.raises(InvalidCSVError, match="Fichier CSV invalide : f.csv"):
+        parse_csv(b"colonne\nvaleur\n", "s3://bucket/transactions/f.csv")
+
+
+def test_parse_csv_encodage_invalide():
+    with pytest.raises(InvalidCSVError, match="encodage invalide"):
+        parse_csv("Crédit".encode("latin-1"), "f.csv")
