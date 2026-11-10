@@ -45,7 +45,7 @@ def sum_received_by_iban(transactions: Sequence[Transaction]) -> dict[str, Decim
 
 def is_high_amount(transaction: Transaction, threshold: Decimal = FLAG_THRESHOLD) -> bool:
     """Vrai si le montant est strictement supérieur au seuil."""
-    return transaction.montant > threshold
+    return transaction.montant >= threshold
 
 
 def flag_transactions(
