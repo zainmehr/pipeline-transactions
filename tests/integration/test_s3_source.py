@@ -200,7 +200,7 @@ def test_bucket_vide(pipeline_env, s3, tmp_path, capsys):
     config, client = s3
     ensure_bucket(client, config.bucket)
     assert main(["--input", str(tmp_path), "--source", "s3", "--save", *NO_WAIT]) == 1
-    assert "aucun fichier CSV dans" in capsys.readouterr().err
+    assert "aucun fichier CSV ou image dans" in capsys.readouterr().err
 
 
 def test_fichier_invalide_dans_le_bucket(pipeline_env, s3, tmp_path, capsys):
