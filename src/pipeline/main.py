@@ -10,6 +10,8 @@
 
 Avec --upload-only, la pipeline s'arrête après l'envoi vers S3 : c'est le rôle d'un
 producteur de données, le traitement étant lancé séparément (ex. CronJob Kubernetes).
+Avec --allow-empty, une source vide n'est pas une erreur : un traitement planifié qui ne
+trouve aucun nouveau fichier se termine normalement.
 
 Un fichier déjà traité (même contenu, donc même hash) est ignoré : la pipeline peut être
 relancée autant de fois que nécessaire sans jamais compter une transaction deux fois.
@@ -156,12 +158,12 @@ def print_report(result: ProcessingResult) -> None:
 # --- Étapes ------------------------------------------------------------------
 
 
-def read_local(directory: Path) -> list[SourceFile]:
+def read_local(directory: Path, allow_empty: bool = False) -> list[SourceFile]:
     try:
         files = read_local_files(directory)
     except FileNotFoundError as error:
         raise PipelineError(str(error)) from error
-    if not files:
+    if not files and not allow_empty:
         raise PipelineError(f"aucun fichier CSV ou image dans {directory}")
     return files
 
@@ -227,13 +229,23 @@ def retrieve_from_s3(
     processed_hashes: set[str],
     policy: RetryPolicy,
     failures: SimulatedFailures,
+    allow_empty: bool = False,
 ) -> list[SourceFile]:
     print(f"  source : {config.describe()}")
     if failures.remaining:
         print(f"  [simulation] les {failures.remaining} prochains téléchargements échoueront")
+    client = create_client(config)
     try:
+        if allow_empty:
+            # Traitement planifié : il peut démarrer avant le premier dépôt de fichiers.
+            retry(
+                lambda: ensure_bucket(client, config.bucket),
+                policy,
+                TRANSIENT_S3_ERRORS,
+                "connexion au stockage S3",
+            )
         files, total = fetch_s3_files(
-            create_client(config), config.bucket, processed_hashes, policy, failures.trigger
+            client, config.bucket, processed_hashes, policy, failures.trigger
         )
     except RetryError as error:
         raise PipelineError(
@@ -246,7 +258,7 @@ def retrieve_from_s3(
             f"erreur du stockage S3 ({config.describe()}) : {error}\n"
             "Le traitement est arrêté : aucune donnée n'a été insérée."
         ) from error
-    if total == 0:
+    if total == 0 and not allow_empty:
         raise PipelineError(f"aucun fichier CSV ou image dans {config.describe()}")
     return files
 
@@ -323,6 +335,7 @@ def run(
     simulate_download_failures: int = 0,
     images: int = 0,
     upload_only: bool = False,
+    allow_empty: bool = False,
 ) -> None:
     """Exécute la pipeline. Lève PipelineError en cas d'échec."""
     if source not in SOURCES:
@@ -373,11 +386,15 @@ def run(
     step(4, "Récupération des fichiers")
     if source == "s3":
         new_files = retrieve_from_s3(
-            s3_config, processed_hashes, policy, download_failures(simulate_download_failures)
+            s3_config,
+            processed_hashes,
+            policy,
+            download_failures(simulate_download_failures),
+            allow_empty,
         )
     else:
         print(f"  source : dossier local {input_dir}")
-        new_files = exclude_processed(read_local(input_dir), processed_hashes)
+        new_files = exclude_processed(read_local(input_dir, allow_empty), processed_hashes)
 
     step(5, "Chargement et traitement")
     loaded = load_files(new_files)
@@ -430,6 +447,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="S'arrête après l'envoi vers S3 (le traitement est lancé séparément)",
     )
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Une source sans aucun fichier n'est pas une erreur (traitement planifié)",
+    )
     parser.add_argument("--save", action="store_true", help="Insère les résultats en base")
     parser.add_argument(
         "--max-attempts", type=int, default=3, help="Nombre maximal de tentatives (défaut : 3)"
@@ -477,6 +499,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             simulate_download_failures=args.simulate_download_failures,
             images=args.images,
             upload_only=args.upload_only,
+            allow_empty=args.allow_empty,
         )
     except PipelineError as error:
         print(f"\nERREUR : {error}", file=sys.stderr)

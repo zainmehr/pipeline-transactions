@@ -68,3 +68,10 @@ def test_upload_only_necessite_upload(tmp_path, capsys):
     with pytest.raises(SystemExit):
         main(["--input", str(tmp_path), "--upload-only"])
     assert "--upload-only nécessite --upload" in capsys.readouterr().err
+
+
+def test_dossier_vide_accepte_avec_allow_empty(tmp_path, capsys):
+    assert main(["--input", str(tmp_path), "--allow-empty"]) == 0
+    sortie = capsys.readouterr().out
+    assert "0 nouveau(x) fichier(s) à traiter sur 0" in sortie
+    assert "Pipeline terminée avec succès" in sortie
