@@ -4,11 +4,14 @@ Projet réalisé par **Zain MEHR** et **Adam GHORIFA**.
 
 ## Objectif
 
-Pipeline data automatisée allant de la génération de transactions financières au format CSV
-jusqu'à leur insertion dans une base de données relationnelle, intégrée à une démarche CI/CD :
+Pipeline data automatisée allant de la génération de transactions financières (fichiers CSV
+et relevés au format image) jusqu'à leur insertion dans une base de données relationnelle,
+intégrée à une démarche CI/CD, et déployée automatiquement sur Kubernetes :
 
 ```
-Génération CSV → Stockage S3 → Récupération → Chargement → Validation → Traitement → Base de données
+CSV ──────────────┐
+                  ├──> Stockage S3 → Récupération → Chargement → Validation → Traitement → Base de données
+Images ──> OCR ───┘
 ```
 
 ## Stack technique
@@ -21,15 +24,19 @@ Génération CSV → Stockage S3 → Récupération → Chargement → Validatio
 | CI | GitHub Actions |
 | Base de données | PostgreSQL 16 (psycopg 3) |
 | Stockage objet | RustFS 1.0, compatible S3 (boto3) |
-| Conteneurs | Docker Compose |
+| OCR | Tesseract 5 (langue française), images générées avec Pillow |
+| Conteneurs | Docker, Docker Compose (local) |
+| CD et production | Kubernetes (kind dans GitHub Actions), CronJob, registre GHCR |
 
 ## Structure du projet
 
 ```
 ├── .github/workflows/ci.yml   → pipeline CI
+├── .github/workflows/cd.yml   → pipeline CD (déploiement Kubernetes)
 ├── src/pipeline/
-│   ├── generation/            → génération des fichiers CSV
-│   ├── loading/               → récupération (local ou S3) et chargement des fichiers
+│   ├── generation/            → génération des fichiers CSV et des relevés images
+│   ├── loading/               → récupération (local ou S3), chargement des CSV, OCR des images
+│   ├── extraction/            → extraction des transactions du texte OCR (fonctions pures)
 │   ├── processing/            → traitements (fonctions pures)
 │   ├── storage/               → schéma SQL, insertion en base et stockage S3
 │   ├── models.py              → modèles de données partagés (Transaction, ...)
@@ -40,10 +47,13 @@ Génération CSV → Stockage S3 → Récupération → Chargement → Validatio
 │   ├── unit/                  → tests unitaires
 │   └── integration/           → tests d'intégration
 ├── sql/init/                  → scripts d'initialisation du conteneur PostgreSQL
+├── Dockerfile                 → image du système de traitement (pipeline + Tesseract)
+├── k8s/                       → manifestes Kubernetes de la production (kustomize)
+├── scripts/k8s.sh             → déploiement et vérification sur Kubernetes
 ├── docker-compose.yml         → PostgreSQL et RustFS (S3) en local
 ├── Makefile                   → raccourcis (make pipeline, make test, ...)
 ├── .env.example               → modèle de configuration
-├── data/                      → fichiers CSV générés (non versionnés)
+├── data/                      → fichiers CSV et images générés (non versionnés)
 └── docs/screenshots/          → captures de la simulation d'échec
 ```
 
@@ -54,6 +64,15 @@ python3 -m venv .venv
 source .venv/bin/activate        # Windows : .venv\Scripts\activate
 pip install -e ".[dev]"
 cp .env.example .env
+```
+
+Le traitement des relevés images nécessite **Tesseract** avec la langue française (les
+tests OCR sont ignorés en local s'il n'est pas installé) :
+
+```bash
+sudo apt install tesseract-ocr tesseract-ocr-fra   # Debian / Ubuntu
+brew install tesseract tesseract-lang              # macOS
+# Windows : installateur UB Mannheim (cocher la langue « French »)
 ```
 
 ## Démarrage rapide
@@ -84,6 +103,14 @@ toutes les commandes disponibles :
 | `make demo-retry-s3` | Démo : 2 pannes simulées à la récupération depuis S3, puis succès |
 | `make demo-retry-s3-echec` | Démo : fichier S3 inaccessible, arrêt propre après 3 tentatives |
 | `make demo-panne-s3` | Démo réelle : RustFS arrêté puis redémarré pendant la récupération |
+| `make pipeline-ocr` | Pipeline complète avec CSV **et** relevés images lus par OCR (`IMAGES=3 make pipeline-ocr`) |
+| `make demo-ocr-echec` | Démo : une image illisible arrête la pipeline, rien n'est inséré |
+| `make docker-build` | Construit l'image Docker du système de traitement |
+| `make k8s-up` | Déploie la production dans un cluster Kubernetes local (kind) |
+| `make k8s-depot` | Dépose des CSV et des images dans le bucket du cluster |
+| `make k8s-traitement` | Lance le traitement tout de suite, sans attendre le CronJob |
+| `make k8s-etat` | État du cluster et fichiers traités en base |
+| `make k8s-down` | Supprime le cluster local |
 
 ## Utilisation
 
@@ -131,11 +158,14 @@ run-pipeline --input data --generate 5 --seed 42 --upload --source s3 --save
 
 | Option | Rôle |
 |---|---|
-| `--input` | Dossier des fichiers CSV (défaut : `data`) |
-| `--generate N` | Génère N fichiers avant le traitement |
+| `--input` | Dossier des fichiers CSV et images (défaut : `data`) |
+| `--generate N` | Génère N fichiers CSV avant le traitement |
+| `--images N` | Génère N relevés au format image (PNG) avant le traitement |
 | `--seed` | Graine de génération (défaut : 42) |
-| `--upload` | Envoie les CSV dans le bucket S3 et vérifie leur présence |
+| `--upload` | Envoie les fichiers dans le bucket S3 et vérifie leur présence |
+| `--upload-only` | S'arrête après l'envoi : le traitement est lancé séparément (CronJob) |
 | `--source` | Origine des fichiers à traiter : `local` (défaut) ou `s3` |
+| `--allow-empty` | Une source sans aucun fichier n'est pas une erreur (traitement planifié) |
 | `--save` | Insère les résultats en base |
 | `--max-attempts` | Nombre maximal de tentatives par accès à la base ou à S3 (défaut : 3) |
 | `--retry-delay` | Attente avant la 2e tentative, doublée ensuite (défaut : 1 s) |
@@ -144,14 +174,15 @@ run-pipeline --input data --generate 5 --seed 42 --upload --source s3 --save
 
 La pipeline s'exécute en six étapes affichées dans le terminal :
 
-1. **Génération des CSV** (avec `--generate`).
+1. **Génération des fichiers** : CSV (avec `--generate`) et relevés images (avec `--images`).
 2. **Envoi vers le stockage S3** (avec `--upload`) : création du bucket s'il n'existe pas,
    envoi des fichiers, puis vérification de leur présence et de leur intégrité.
 3. **Préparation de la base** (avec `--save`) : création du schéma s'il n'existe pas, et
    lecture des empreintes des fichiers déjà traités.
 4. **Récupération des fichiers** depuis le bucket S3 (`--source s3`) ou le dossier local,
    en excluant les fichiers déjà traités.
-5. **Chargement et traitement** : validation de tous les nouveaux fichiers, puis calcul des
+5. **Chargement et traitement** : lecture des CSV, lecture des images par OCR, validation
+   de tous les nouveaux fichiers, puis calcul des
    sommes envoyées par `iban_origine`, envoyées par `banque_source` et reçues par
    `iban_destinataire`, et flag des transactions de plus de 5000 (rapport affiché).
 6. **Insertion en base** (avec `--save`) : chaque fichier est inséré avec ses transactions
@@ -167,7 +198,7 @@ rien et se termine avec le code retour `1`, ce qui fait échouer la CI.
 
 ### Stockage S3
 
-Les fichiers CSV sont stockés dans un service compatible S3, **RustFS**, lancé en local
+Les fichiers (CSV et images) sont stockés dans un service compatible S3, **RustFS**, lancé en local
 avec Docker Compose et en CI comme service du job d'intégration. Aucun service cloud
 n'est utilisé. Sa console web est accessible sur http://localhost:9001, avec les
 identifiants `S3_ACCESS_KEY` et `S3_SECRET_KEY` du fichier `.env`.
@@ -277,8 +308,10 @@ redémarré 5 secondes plus tard, pendant que la pipeline réessaie de s'y conne
 Disque ou S3 ──> loading (I/O) ──> parse_csv + validation (purs) ──> processing (pur) ──> résultats
 ```
 
-- **`loading/`** : récupération des fichiers (disque local ou S3) et décodage du CSV,
-  aucune logique métier.
+- **`loading/`** : récupération des fichiers (disque local ou S3), décodage du CSV et
+  appel de Tesseract pour les images, aucune logique métier.
+- **`extraction/`** : extraction et normalisation des transactions à partir du texte OCR
+  (fonctions pures).
 - **`validation.py`** : conversion d'une ligne en `Transaction` et contrôle du format
   (colonnes, date ISO 8601, montant positif à 2 décimales, IBAN valide et cohérent avec
   le pays, émetteur différent du destinataire). Toutes les erreurs d'une ligne sont
@@ -287,6 +320,142 @@ Disque ou S3 ──> loading (I/O) ──> parse_csv + validation (purs) ──>
   immuables), ne dépendent d'aucun état externe et renvoient toujours le même résultat
   pour les mêmes entrées. Des tests vérifient explicitement ces trois propriétés.
 
+## Niveau 3 — Option 2 : relevés images lus par OCR
+
+La pipeline traite aussi des transactions contenues dans des **images** (PNG, JPEG, TIFF).
+Elles rejoignent exactement le même flux que les CSV : stockage S3, absence de double
+traitement, validation, traitements, insertion.
+
+```
+Image ──> OCR (Tesseract) ──> extraction ──> normalisation ──> validation ──> traitement ──> base
+          loading/ocr.py      extraction/statement.py         validation.py   (identiques aux CSV)
+```
+
+### Les relevés générés
+
+`generate-images --output data --images 2 --seed 42` (ou `run-pipeline --images N`) produit
+des relevés d'opérations de 3 transactions chacun, au format d'un document bancaire :
+
+```
+RELEVÉ D'OPÉRATIONS
+Référence : REL-42-001
+Nombre de transactions : 3
+
+Transaction 1
+Date : 01/01/2026 08:22:30
+IBAN émetteur : FR24 3000 3012 3400 0112 2334 455
+Pays émetteur : FR
+Banque émettrice : Société Générale
+IBAN destinataire : IT65 X020 0801 6000 0001 2345 678
+Pays destinataire : IT
+Montant : 4 999,99 EUR
+...
+```
+
+- **Déterministes**, comme les CSV : même graine, mêmes images (la police DejaVu Sans Mono
+  est embarquée dans le paquet pour un rendu identique sur toutes les machines), donc même
+  empreinte SHA-256 et aucun double traitement.
+- **Format différent du CSV** (IBAN groupés par 4, date française, montant `4 999,99 EUR`),
+  pour que l'étape de transformation soit réellement nécessaire.
+- **Cas limites du flag** : la première image contient toujours `4999,99`, `5000,00` et
+  `5000,01`, pour vérifier que le seuil est bien appliqué après l'OCR.
+
+### Extraction, transformation et validation
+
+1. **OCR** : Tesseract lit l'image (langue `fra`, pour les accents des noms de banques).
+2. **Extraction** : le texte est découpé en transactions (en-têtes « Transaction N »), et
+   chaque ligne « libellé : valeur » est associée à une colonne, quels que soient les
+   accents, la casse ou les espaces du libellé.
+3. **Normalisation** vers le format CSV : IBAN sans espaces, date ISO 8601, montant
+   `4999.99`. Les confusions classiques de l'OCR sont corrigées uniquement là où le format
+   est sans ambiguïté (ex. `FRO8` → `FR08`, car la clé d'un IBAN est toujours numérique).
+4. **Validation** : chaque transaction passe par **la même fonction de validation que les
+   lignes CSV**. Une erreur de lecture plus profonde est détectée par la clé de contrôle
+   modulo 97 de l'IBAN, et le nombre de transactions lues est comparé à celui annoncé par
+   le relevé (une transaction manquée est détectée).
+
+Une image illisible ou invalide est traitée comme un CSV invalide : **tout ou rien**, aucune
+donnée n'est insérée et la pipeline s'arrête avec le code retour `1` (`make demo-ocr-echec`).
+
+```
+ERREUR : Image invalide : releve_002.png (1 erreur(s))
+  - transaction 2 : iban_origine invalide : 'FR7630004000031234561890143'
+Aucune donnée n'a été insérée.
+```
+
+**Fiabilité mesurée** : sur 120 relevés générés avec des graines différentes, l'OCR
+retrouve exactement les transactions dessinées (accents compris) ; un test vérifie aussi un
+scan de qualité moyenne (JPEG compressé, flou et légèrement penché).
+
+## Niveau 3 — Option 1 : déploiement continu sur Kubernetes
+
+L'environnement de production est décrit dans `k8s/` et déployé avec `kubectl apply -k k8s` :
+
+| Ressource | Rôle |
+|---|---|
+| `StatefulSet/postgres` + volume persistant | Base de données relationnelle |
+| `StatefulSet/rustfs` + volume persistant | Stockage S3 (API 9000, console 9001) |
+| `CronJob/pipeline-traitement` | Système de traitement, lancé **toutes les 2 minutes** |
+| `ConfigMap/pipeline-config`, `Secret/pipeline-secrets` | Configuration et identifiants |
+| `k8s/jobs/depot-donnees.yaml` | Job de dépôt de données dans le bucket (source externe simulée) |
+
+Le système de traitement est une **image Docker** (`Dockerfile` : Python 3.12, la pipeline et
+Tesseract), exécutée sans privilèges et avec un système de fichiers en lecture seule.
+
+### Traitement régulier des nouvelles données
+
+Toutes les 2 minutes, le CronJob lance `run-pipeline --source s3 --save --allow-empty` :
+il récupère dans le bucket les fichiers (CSV et images) **qui n'ont pas encore été traités**,
+grâce aux empreintes de la table `processed_files`, puis les charge, les valide, les traite
+et les insère. S'il n'y a rien de nouveau, il se termine normalement (`--allow-empty`).
+`concurrencyPolicy: Forbid` empêche deux traitements de se chevaucher.
+
+Le dépôt des données est séparé du traitement, comme en production où les fichiers arrivent
+d'une source externe : `run-pipeline ... --upload --upload-only` envoie les fichiers dans le
+bucket sans les traiter.
+
+### La pipeline CD (`.github/workflows/cd.yml`)
+
+```
+Pull Request ou CI verte sur main
+   │
+   ├─ 1. Déploiement et vérification (cluster Kubernetes kind, créé dans GitHub Actions)
+   │     construction de l'image ─> contrôle (Tesseract, utilisateur non root)
+   │     ─> déploiement ─> 1er traitement planifié sur un bucket vide
+   │     ─> dépôt de 3 CSV + 2 images ─> traitement automatique par le CronJob ─> contrôles SQL
+   │     ─> nouveau dépôt (données déjà connues + nouvelles) ─> seules les nouvelles traitées
+   │     ─> redémarrage de la base : les données sont conservées
+   │
+   ├─ 2. Publication de l'image dans GHCR (main uniquement, image vérifiée à l'étape 1)
+   │     ghcr.io/zainmehr/pipeline-transactions:<commit> et :latest
+   │
+   └─ 3. Déploiement en production (main uniquement, environnement GitHub « production »)
+         sur le cluster défini par le secret KUBE_CONFIG
+```
+
+Les contrôles SQL (`scripts/k8s.sh verifier`) vérifient le nombre de fichiers traités, la
+présence de relevés images, l'absence de fichier traité deux fois, la cohérence entre
+sommes stockées et recalculées, et le positionnement des flags.
+
+**Cluster de production.** Le déploiement vérifié à l'étape 1 a lieu dans un cluster
+Kubernetes éphémère (kind) : aucune infrastructure n'est nécessaire. Pour déployer sur un
+vrai cluster, il suffit d'ajouter dans les secrets du dépôt `KUBE_CONFIG` (kubeconfig du
+cluster) et les identifiants `DB_USER`, `DB_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` :
+l'étape 3 applique alors les mêmes manifestes avec l'image publiée. Sans `KUBE_CONFIG`,
+elle se contente de l'indiquer.
+
+### En local
+
+Avec Docker et [kind](https://kind.sigs.k8s.io/) installés :
+
+```bash
+make k8s-up                       # cluster kind, image, déploiement
+make k8s-depot SEED=7             # dépose 5 CSV et 2 images dans le bucket
+make k8s-etat                     # au bout de 2 minutes au plus : fichiers traités en base
+make k8s-traitement               # ou lancer le traitement tout de suite
+make k8s-down
+```
+
 ## Base de données
 
 Le schéma est défini dans `src/pipeline/storage/schema.sql`. Il est idempotent et embarqué
@@ -294,7 +463,7 @@ dans le paquet Python, pour fonctionner aussi dans un conteneur.
 
 | Table | Contenu |
 |---|---|
-| `processed_files` | Fichiers insérés, identifiés par le hash SHA-256 de leur contenu (unique) |
+| `processed_files` | Fichiers insérés, identifiés par le hash SHA-256 de leur contenu (unique), avec leur type (`csv` ou `image`) |
 | `accounts` | Comptes (IBAN, pays), le pays devant correspondre au préfixe de l'IBAN |
 | `banks` | Banques émettrices |
 | `transactions` | Transactions avec leur flag, rattachées à leur fichier, leurs comptes et leur banque |
@@ -325,6 +494,7 @@ validation Python était contournée.
 pytest                                           # tous les tests
 pytest -m "not integration"                      # tests unitaires uniquement
 pytest -m integration                            # tests d'intégration (PostgreSQL requis)
+pytest -m ocr                                    # tests de lecture OCR (Tesseract requis)
 pytest --cov=pipeline --cov-report=term-missing  # avec couverture
 ruff check . && ruff format --check .            # lint et formatage
 ```
@@ -337,11 +507,18 @@ maximal de tentatives, la reprise et l'absence de doublons. `test_s3.py` couvre 
 création du bucket, l'envoi, la vérification d'intégrité et la commande `list-s3`.
 `test_s3_source.py` couvre la lecture depuis S3 : fichiers déjà traités ignorés sans
 téléchargement, contenu altéré, pannes simulées puis succès, arrêt propre et reprise,
-traitement complet sans aucun fichier local.
+traitement complet sans aucun fichier local, traitement planifié sur bucket vide.
+
+Pour le niveau 3, `test_extraction.py` et `test_images.py` testent l'extraction et la
+génération des images sans Tesseract (OCR simulé), `test_ocr.py` la lecture réelle par
+Tesseract, et `test_ocr_pipeline.py` la pipeline de bout en bout avec des images : valeurs
+en base identiques aux transactions dessinées, flags des cas limites, CSV et images
+mélangés, image renommée non retraitée, image illisible, lecture depuis S3, retry, dépôt
+puis traitement séparé.
 
 Les tests utilisent la base `pipeline_test`, vidée avant chaque test, et un bucket S3
 temporaire propre à chaque test, supprimé ensuite. Si un service n'est pas lancé, ses tests
-sont ignorés en local ; en CI (`REQUIRE_DB=1`, `REQUIRE_S3=1`), ils échouent.
+sont ignorés en local ; en CI (`REQUIRE_DB=1`, `REQUIRE_S3=1`, `REQUIRE_OCR=1`), ils échouent.
 
 Reproduire la CI en local avant de pousser :
 
@@ -354,7 +531,9 @@ make ci
 La CI (GitHub Actions) se déclenche sur chaque Pull Request et sur chaque push sur `main`.
 Elle comporte deux jobs :
 
-1. **Qualité et tests unitaires** : lint, formatage, tests unitaires avec couverture.
+1. **Qualité et tests unitaires** : lint, formatage, tests unitaires avec couverture (dont la
+   lecture réelle d'images par Tesseract), puis contrôle du script de déploiement
+   (shellcheck), du Dockerfile (hadolint) et des manifestes Kubernetes (kubeconform).
 2. **Base de données et tests d'intégration** (lancé seulement si le premier réussit) :
    démarre PostgreSQL et RustFS, exécute les tests d'intégration, lance la pipeline
    complète (envoi vers S3 puis lecture depuis S3), la relance pour vérifier l'absence de
@@ -362,6 +541,12 @@ Elle comporte deux jobs :
    fichiers en base et la cohérence des sommes. Il simule ensuite, à l'insertion puis à la
    récupération depuis S3, des pannes temporaires (retry puis succès), des pannes
    persistantes (arrêt attendu) et une reprise, et vérifie à nouveau le bucket et la base.
+   Enfin, il traite des relevés images (envoi S3, OCR, insertion), sépare dépôt et
+   traitement comme le CronJob, et vérifie en SQL les relevés en base et les flags lus par OCR.
+
+La CD (déploiement Kubernetes) est décrite dans la section
+[Option 1](#niveau-3--option-1--déploiement-continu-sur-kubernetes) : sur `main`, elle ne
+démarre qu'après une CI verte.
 
 ## Workflow Git
 
@@ -388,5 +573,5 @@ Elle comporte deux jobs :
 - [x] 2.4 Retry lors de la récupération depuis le S3
 
 ### Niveau 3 — Améliorations
-- [ ] Option à choisir
-- [ ] Option à choisir
+- [x] Option 1 — Pipeline CD et déploiement sur Kubernetes (CronJob de traitement)
+- [x] Option 2 — Extraction de transactions depuis des images avec OCR (Tesseract)
