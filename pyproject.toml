@@ -7,6 +7,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
     "boto3>=1.35",
+    "pillow>=10.4",
 ]
 
 [project.optional-dependencies]
@@ -16,6 +17,7 @@ dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
 generate-csv = "pipeline.generation.generator:main"
 run-pipeline = "pipeline.main:main"
 list-s3 = "pipeline.storage.s3:main"
+generate-images = "pipeline.generation.images:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -25,11 +27,14 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-pipeline = ["storage/*.sql"]
+pipeline = ["storage/*.sql", "generation/fonts/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: tests nécessitant la base de données"]
+markers = [
+    "integration: tests nécessitant la base de données",
+    "ocr: tests nécessitant Tesseract (OCR)",
+]
 
 [tool.ruff]
 line-length = 100
