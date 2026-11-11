@@ -1,11 +1,15 @@
 """Point d'entrée de la pipeline : orchestre toutes les étapes.
 
-    [1/6] Génération des CSV            (option --generate N)
+    [1/6] Génération des fichiers       (options --generate N et --images N)
     [2/6] Envoi vers le stockage S3     (option --upload) : bucket, envoi, vérification
     [3/6] Préparation de la base        (option --save) : schéma + fichiers déjà traités
     [4/6] Récupération des fichiers     (option --source local|s3)
-    [5/6] Chargement et traitement      : validation de tous les nouveaux fichiers
+    [5/6] Chargement et traitement      : CSV lus directement, images lues par OCR,
+                                          puis validation de tous les nouveaux fichiers
     [6/6] Insertion en base             (option --save)
+
+Avec --upload-only, la pipeline s'arrête après l'envoi vers S3 : c'est le rôle d'un
+producteur de données, le traitement étant lancé séparément (ex. CronJob Kubernetes).
 
 Un fichier déjà traité (même contenu, donc même hash) est ignoré : la pipeline peut être
 relancée autant de fois que nécessaire sans jamais compter une transaction deux fois.
@@ -32,7 +36,10 @@ from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 from pipeline.generation.generator import DEFAULT_SEED, generate_files
-from pipeline.loading.csv_loader import InvalidCSVError, parse_csv
+from pipeline.generation.images import generate_image_files
+from pipeline.loading.csv_loader import InvalidCSVError
+from pipeline.loading.ocr import OCRUnavailableError, check_tesseract
+from pipeline.loading.parsers import content_type, parse_file, source_type
 from pipeline.loading.sources import (
     SourceFile,
     exclude_processed,
@@ -155,7 +162,7 @@ def read_local(directory: Path) -> list[SourceFile]:
     except FileNotFoundError as error:
         raise PipelineError(str(error)) from error
     if not files:
-        raise PipelineError(f"aucun fichier CSV dans {directory}")
+        raise PipelineError(f"aucun fichier CSV ou image dans {directory}")
     return files
 
 
@@ -172,7 +179,12 @@ def upload_files(config: S3Config, files: Sequence[SourceFile], policy: RetryPol
     for file in files:
         key = call(
             lambda file=file: upload_file(
-                client, config.bucket, file.name, file.content, file.file_hash
+                client,
+                config.bucket,
+                file.name,
+                file.content,
+                file.file_hash,
+                content_type(file.name),
             ),
             f"envoi de {file.name}",
         )
@@ -235,19 +247,26 @@ def retrieve_from_s3(
             "Le traitement est arrêté : aucune donnée n'a été insérée."
         ) from error
     if total == 0:
-        raise PipelineError(f"aucun fichier CSV dans {config.describe()}")
+        raise PipelineError(f"aucun fichier CSV ou image dans {config.describe()}")
     return files
 
 
 def load_files(files: Sequence[SourceFile]) -> list[LoadedFile]:
-    """Décode et valide tous les fichiers avant toute insertion."""
+    """Décode et valide tous les fichiers (CSV, ou images lues par OCR) avant toute
+    insertion."""
+    if any(source_type(file.name) == "image" for file in files):
+        try:
+            print(f"  OCR : {check_tesseract()}")
+        except OCRUnavailableError as error:
+            raise PipelineError(f"{error}\nAucune donnée n'a été insérée.") from error
     loaded = []
     for file in files:
         try:
-            transactions = parse_csv(file.content, file.name)
+            transactions = parse_file(file.content, file.name)
         except InvalidCSVError as error:
             raise PipelineError(f"{error}\nAucune donnée n'a été insérée.") from error
-        print(f"  {file.name} : {len(transactions)} transactions chargées")
+        origin = " (extraites par OCR)" if source_type(file.name) == "image" else ""
+        print(f"  {file.name} : {len(transactions)} transactions chargées{origin}")
         loaded.append(LoadedFile(file, transactions))
     return loaded
 
@@ -271,6 +290,7 @@ def insert_files(
                     loaded.file.file_hash,
                     result,
                     before_commit=failures.hook(name),
+                    source_type=source_type(name),
                 )
 
         try:
@@ -301,6 +321,8 @@ def run(
     upload: bool = False,
     source: str = "local",
     simulate_download_failures: int = 0,
+    images: int = 0,
+    upload_only: bool = False,
 ) -> None:
     """Exécute la pipeline. Lève PipelineError en cas d'échec."""
     if source not in SOURCES:
@@ -309,12 +331,15 @@ def run(
     s3_config = S3Config.from_env()
     db_config = DatabaseConfig.from_env()
 
-    step(1, "Génération des CSV")
+    step(1, "Génération des fichiers")
     if generate:
         for path in generate_files(input_dir, generate, seed):
             print(f"  {path.name} généré")
-    else:
-        print("  ignorée (utiliser --generate N)")
+    if images:
+        for path in generate_image_files(input_dir, images, seed):
+            print(f"  {path.name} généré (image)")
+    if not generate and not images:
+        print("  ignorée (utiliser --generate N et/ou --images N)")
 
     step(2, "Envoi vers le stockage S3")
     if upload:
@@ -330,6 +355,10 @@ def run(
             ) from error
     else:
         print("  ignoré (utiliser --upload)")
+
+    if upload_only:
+        print("\nTraitement non demandé (--upload-only) : les fichiers sont dans le stockage S3.")
+        return
 
     step(3, "Préparation de la base")
     processed_hashes: set[str] = set()
@@ -379,6 +408,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--generate", type=int, default=0, metavar="N", help="Génère N fichiers avant traitement"
     )
+    parser.add_argument(
+        "--images",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Génère N relevés au format image (lus par OCR) avant traitement",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Graine de génération")
     parser.add_argument(
         "--upload", action="store_true", help="Envoie les CSV dans le stockage S3 et vérifie"
@@ -388,6 +424,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=SOURCES,
         default="local",
         help="Origine des fichiers à traiter : dossier local ou bucket S3 (défaut : local)",
+    )
+    parser.add_argument(
+        "--upload-only",
+        action="store_true",
+        help="S'arrête après l'envoi vers S3 (le traitement est lancé séparément)",
     )
     parser.add_argument("--save", action="store_true", help="Insère les résultats en base")
     parser.add_argument(
@@ -415,6 +456,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.upload_only and not args.upload:
+        parser.error("--upload-only nécessite --upload")
+
     try:
         policy = RetryPolicy(max_attempts=args.max_attempts, initial_delay=args.retry_delay)
     except ValueError as error:
@@ -431,6 +475,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             upload=args.upload,
             source=args.source,
             simulate_download_failures=args.simulate_download_failures,
+            images=args.images,
+            upload_only=args.upload_only,
         )
     except PipelineError as error:
         print(f"\nERREUR : {error}", file=sys.stderr)

@@ -15,6 +15,12 @@ CREATE TABLE IF NOT EXISTS processed_files (
     CONSTRAINT processed_files_file_hash_key UNIQUE (file_hash)
 );
 
+-- Type du fichier source : CSV, ou image lue par OCR (niveau 3). Ajouté par ALTER pour
+-- mettre à jour sans perte une base créée avant l'ajout des images.
+ALTER TABLE processed_files
+    ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'csv'
+    CONSTRAINT processed_files_source_type_check CHECK (source_type IN ('csv', 'image'));
+
 -- Comptes bancaires (émetteurs et destinataires).
 CREATE TABLE IF NOT EXISTS accounts (
     iban  VARCHAR(34)  PRIMARY KEY,
