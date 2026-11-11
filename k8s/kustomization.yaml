@@ -1,0 +1,18 @@
+# Environnement de production de la pipeline : `kubectl apply -k k8s`.
+# Le secret `pipeline-secrets` (identifiants) n'est pas versionné : il est créé par la
+# pipeline CD (ou `make k8s-secret`) avant l'application de ces manifestes.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: pipeline-transactions
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: pipeline-transactions
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - config.yaml
+  - postgres.yaml
+  - rustfs.yaml
+  - cronjob.yaml

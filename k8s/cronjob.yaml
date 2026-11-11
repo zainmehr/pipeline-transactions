@@ -1,0 +1,61 @@
+# Système de traitement : lancé toutes les 2 minutes, il récupère dans le bucket S3 les
+# fichiers (CSV et images) qui n'ont pas encore été traités, les charge, les valide, les
+# traite et les insère en base. Un fichier déjà traité n'est jamais retraité (hash SHA-256
+# enregistré dans processed_files), et deux exécutions ne se chevauchent jamais.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pipeline-traitement
+  labels:
+    app.kubernetes.io/name: pipeline-traitement
+spec:
+  schedule: "*/2 * * * *"
+  timeZone: Europe/Paris
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 100
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pipeline-traitement
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: pipeline-traitement
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+          containers:
+            - name: traitement
+              image: pipeline-transactions:local
+              imagePullPolicy: IfNotPresent
+              args: ["--source", "s3", "--save", "--allow-empty", "--max-attempts", "5"]
+              envFrom:
+                - configMapRef:
+                    name: pipeline-config
+                - secretRef:
+                    name: pipeline-secrets
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
