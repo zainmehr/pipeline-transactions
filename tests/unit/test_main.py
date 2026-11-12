@@ -41,3 +41,37 @@ def test_source_inconnue_refusee(tmp_path, capsys):
     with pytest.raises(SystemExit):
         main(["--input", str(tmp_path), "--source", "ftp"])
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_images_sans_tesseract(tmp_path, capsys, monkeypatch):
+    """Sans Tesseract, la pipeline s'arrête avec un message clair, avant tout traitement."""
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    assert main(["--input", str(tmp_path), "--images", "1"]) == 1
+    erreur = capsys.readouterr().err
+    assert "Tesseract est introuvable" in erreur
+    assert "Aucune donnée n'a été insérée" in erreur
+
+
+def test_run_ocr_sans_tesseract(monkeypatch):
+    import pytest
+
+    from pipeline.loading.ocr import OCRUnavailableError, run_ocr
+
+    monkeypatch.setenv("PATH", "")
+    with pytest.raises(OCRUnavailableError):
+        run_ocr(b"image")
+
+
+def test_upload_only_necessite_upload(tmp_path, capsys):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        main(["--input", str(tmp_path), "--upload-only"])
+    assert "--upload-only nécessite --upload" in capsys.readouterr().err
+
+
+def test_dossier_vide_accepte_avec_allow_empty(tmp_path, capsys):
+    assert main(["--input", str(tmp_path), "--allow-empty"]) == 0
+    sortie = capsys.readouterr().out
+    assert "0 nouveau(x) fichier(s) à traiter sur 0" in sortie
+    assert "Pipeline terminée avec succès" in sortie

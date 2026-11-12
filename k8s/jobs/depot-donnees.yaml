@@ -1,0 +1,54 @@
+# Dépôt de données dans le bucket S3, comme le ferait une source externe : génère des CSV et
+# des relevés images puis les envoie dans le bucket, sans les traiter (--upload-only).
+# Le traitement est fait ensuite par le CronJob `pipeline-traitement`.
+#
+#   kubectl create -n pipeline-transactions -f k8s/jobs/depot-donnees.yaml
+#
+# La pipeline CD adapte la graine et le nombre de fichiers (variables SEED, FILES, IMAGES).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: depot-donnees-
+  labels:
+    app.kubernetes.io/name: depot-donnees
+    app.kubernetes.io/part-of: pipeline-transactions
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: depot-donnees
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: depot
+          image: pipeline-transactions:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - --input=/tmp/data
+            - --generate=${FILES}
+            - --images=${IMAGES}
+            - --seed=${SEED}
+            - --upload
+            - --upload-only
+            - --max-attempts=5
+          envFrom:
+            - configMapRef:
+                name: pipeline-config
+            - secretRef:
+                name: pipeline-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

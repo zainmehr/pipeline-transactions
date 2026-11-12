@@ -1,6 +1,6 @@
 """Accès au stockage objet compatible S3 (RustFS en local et en CI).
 
-Les fichiers CSV sont envoyés dans un bucket sous la clé
+Les fichiers (CSV et images) sont envoyés dans un bucket sous la clé
 `transactions/<16 premiers caractères de l'empreinte SHA-256>/<nom du fichier>`.
 La clé dépend du contenu : renvoyer le même fichier ne crée pas de doublon, et un fichier
 de même nom mais de contenu différent n'écrase jamais le précédent, même s'il n'a pas
@@ -114,7 +114,14 @@ def ensure_bucket(client, bucket: str) -> bool:
     return True
 
 
-def upload_file(client, bucket: str, file_name: str, content: bytes, file_hash: str) -> str:
+def upload_file(
+    client,
+    bucket: str,
+    file_name: str,
+    content: bytes,
+    file_hash: str,
+    content_type: str = "text/csv",
+) -> str:
     """Envoie le contenu d'un fichier dans le bucket et retourne la clé de l'objet créé."""
     key = object_key(file_name, file_hash)
     try:
@@ -122,7 +129,7 @@ def upload_file(client, bucket: str, file_name: str, content: bytes, file_hash: 
             Bucket=bucket,
             Key=key,
             Body=content,
-            ContentType="text/csv",
+            ContentType=content_type,
             Metadata={HASH_METADATA: file_hash},
         )
     except ClientError as error:

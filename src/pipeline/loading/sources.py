@@ -1,4 +1,4 @@
-"""Récupération des fichiers CSV à traiter, depuis le disque local ou le stockage S3.
+"""Récupération des fichiers à traiter (CSV et images), depuis le disque local ou le stockage S3.
 
 Chaque fichier récupéré est un `SourceFile` : son nom, son origine (chemin ou URI S3), son
 empreinte SHA-256 et son contenu. La suite de la pipeline (chargement, traitement,
@@ -17,7 +17,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from pipeline.loading.csv_loader import compute_hash, list_csv_files
+from pipeline.loading.csv_loader import compute_hash
+from pipeline.loading.parsers import is_supported, list_input_files
 from pipeline.retry import RetryPolicy, retry
 from pipeline.storage.s3 import (
     TRANSIENT_S3_ERRORS,
@@ -37,11 +38,11 @@ class SourceFile:
 
 
 def read_local_files(directory: Path) -> list[SourceFile]:
-    """Lit les fichiers .csv d'un dossier local. Lève FileNotFoundError si le dossier
-    n'existe pas."""
+    """Lit les fichiers CSV et images d'un dossier local. Lève FileNotFoundError si le
+    dossier n'existe pas."""
     return [
         SourceFile(path.name, path.name, compute_hash(content), content)
-        for path in list_csv_files(directory)
+        for path in list_input_files(directory)
         for content in [path.read_bytes()]
     ]
 
@@ -73,7 +74,7 @@ def fetch_s3_files(
     inject_failure: Callable[[str], None] = lambda name: None,
     log: Callable[[str], None] = print,
 ) -> tuple[list[SourceFile], int]:
-    """Récupère depuis le bucket les fichiers CSV non encore traités.
+    """Récupère depuis le bucket les fichiers (CSV et images) non encore traités.
 
     Retourne les nouveaux fichiers et le nombre total de fichiers présents dans le bucket.
     Chaque accès au stockage est réessayé en cas d'erreur temporaire ; au-delà du nombre
@@ -86,7 +87,7 @@ def fetch_s3_files(
         return retry(func, policy, TRANSIENT_S3_ERRORS, description, log=log)
 
     keys = call(
-        lambda: [key for key in list_keys(client, bucket) if key.endswith(".csv")],
+        lambda: [key for key in list_keys(client, bucket) if is_supported(key)],
         "liste des fichiers du bucket",
     )
     # Traitement dans l'ordre des noms de fichiers (la clé commence par l'empreinte).

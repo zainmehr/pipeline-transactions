@@ -9,6 +9,8 @@ jobs:
   qualite-et-tests:
     name: Qualité et tests unitaires
     runs-on: ubuntu-latest
+    env:
+      REQUIRE_OCR: "1"
     steps:
       - name: Récupération du code
         uses: actions/checkout@v4
@@ -20,6 +22,12 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Installation de Tesseract (OCR)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends tesseract-ocr tesseract-ocr-fra
+          tesseract --version | head -1
+
       - name: Installation des dépendances
         run: pip install -e ".[dev]"
 
@@ -29,8 +37,21 @@ jobs:
       - name: Formatage (ruff)
         run: ruff format --check .
 
-      - name: Tests unitaires
+      - name: Tests unitaires (dont lecture OCR réelle)
         run: pytest -m "not integration" --cov=pipeline --cov-report=term-missing
+
+      - name: Script de déploiement (shellcheck)
+        run: shellcheck scripts/k8s.sh
+
+      - name: Dockerfile (hadolint)
+        run: docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint < Dockerfile
+
+      - name: Manifestes Kubernetes (kustomize + kubeconform)
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          kubectl kustomize k8s | ./kubeconform -strict -summary -kubernetes-version 1.32.0
+          sed -e 's/${SEED}/42/; s/${FILES}/3/; s/${IMAGES}/2/' k8s/jobs/depot-donnees.yaml \
+            | ./kubeconform -strict -summary -kubernetes-version 1.32.0
 
   integration:
     name: Base de données et tests d'intégration
@@ -71,6 +92,7 @@ jobs:
       S3_SECRET_KEY: pipeline-secret
       S3_BUCKET: transactions
       REQUIRE_S3: "1"
+      REQUIRE_OCR: "1"
     steps:
       - name: Récupération du code
         uses: actions/checkout@v4
@@ -81,6 +103,12 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
+
+      - name: Installation de Tesseract (OCR)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends tesseract-ocr tesseract-ocr-fra
+          tesseract --version | head -1
 
       - name: Installation des dépendances
         run: pip install -e ".[dev]"
@@ -164,6 +192,43 @@ jobs:
           fichiers=$(psql -h localhost -U pipeline -d pipeline -tAc "SELECT COUNT(*) FROM processed_files")
           echo "Fichiers en base : $fichiers (5 + 3 + 3 insertion + 3 + 3 récupération S3)"
           test "$fichiers" -eq 17
+          ecarts=$(psql -h localhost -U pipeline -d pipeline -tAc "
+            SELECT COUNT(*) FROM total_sent_by_iban t
+            FULL JOIN v_total_sent_by_iban v USING (iban)
+            WHERE t.total IS DISTINCT FROM v.total")
+          echo "Écarts entre sommes stockées et recalculées : $ecarts"
+          test "$ecarts" -eq 0
+
+      - name: Relevés images (OCR) envoyés dans S3, lus, traités et insérés
+        run: run-pipeline --input data-ocr --images 2 --seed 42 --upload --source s3 --save
+
+      - name: Dépôt seul (--upload-only) puis traitement séparé, comme le CronJob
+        run: |
+          run-pipeline --input data-ocr-depot --generate 1 --images 1 --seed 3001 --upload --upload-only
+          run-pipeline --source s3 --save --allow-empty
+
+      - name: Relance sur un bucket déjà traité (aucun doublon attendu)
+        run: run-pipeline --source s3 --save --allow-empty
+
+      - name: Vérification des relevés images en base
+        env:
+          PGPASSWORD: pipeline
+        run: |
+          objets=$(list-s3 | grep -c '^s3://')
+          echo "Objets dans le bucket : $objets (11 + 2 images + 1 CSV + 1 image)"
+          test "$objets" -eq 15
+          images=$(psql -h localhost -U pipeline -d pipeline -tAc "SELECT COUNT(*) FROM processed_files WHERE source_type = 'image'")
+          echo "Relevés images traités par OCR : $images"
+          test "$images" -eq 3
+          fichiers=$(psql -h localhost -U pipeline -d pipeline -tAc "SELECT COUNT(*) FROM processed_files")
+          echo "Fichiers en base : $fichiers (17 + 2 + 2)"
+          test "$fichiers" -eq 21
+          flags=$(psql -h localhost -U pipeline -d pipeline -tAc "
+            SELECT string_agg(DISTINCT montant || '=' || flag_montant_eleve, ' ')
+            FROM transactions t JOIN processed_files f ON f.id = t.file_id
+            WHERE f.file_name LIKE '%releve_001.png' AND t.montant BETWEEN 4999 AND 5001")
+          echo "Cas limites lus par OCR : $flags"
+          test "$flags" = "4999.99=false 5000.00=false 5000.01=true"
           ecarts=$(psql -h localhost -U pipeline -d pipeline -tAc "
             SELECT COUNT(*) FROM total_sent_by_iban t
             FULL JOIN v_total_sent_by_iban v USING (iban)

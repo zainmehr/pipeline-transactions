@@ -21,7 +21,12 @@ def build_iban(country_code: str, bban: str) -> str:
 def is_valid_iban(iban: str) -> bool:
     """Vérifie le format et la clé de contrôle d'un IBAN."""
     iban = iban.replace(" ", "").upper()
-    if not 15 <= len(iban) <= 34 or not iban.isalnum() or not iban[:2].isalpha():
+    if (
+        not 15 <= len(iban) <= 34
+        or not iban.isascii()
+        or not iban.isalnum()
+        or not iban[:2].isalpha()
+    ):
         return False
     rearranged = iban[4:] + iban[:4]
     return int(_to_digits(rearranged)) % 97 == 1

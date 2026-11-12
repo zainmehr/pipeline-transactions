@@ -83,9 +83,11 @@ def insert_processed_file(
     file_hash: str,
     result: ProcessingResult,
     before_commit: Callable[[], None] | None = None,
+    source_type: str = "csv",
 ) -> int:
     """Insère un fichier traité et ses résultats. Retourne l'identifiant du fichier.
 
+    `source_type` indique l'origine des transactions : « csv » ou « image » (OCR).
     Lève DuplicateFileError si un fichier de même contenu a déjà été inséré.
     `before_commit` est appelé juste avant la validation de la transaction : une exception
     levée à ce moment annule toute l'insertion (utilisé pour simuler une panne).
@@ -100,9 +102,9 @@ def insert_processed_file(
     try:
         with conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO processed_files (file_name, file_hash, nb_transactions) "
-                "VALUES (%s, %s, %s) RETURNING id",
-                (file_name, file_hash, len(transactions)),
+                "INSERT INTO processed_files (file_name, file_hash, nb_transactions, source_type) "
+                "VALUES (%s, %s, %s, %s) RETURNING id",
+                (file_name, file_hash, len(transactions), source_type),
             )
             file_id = cur.fetchone()[0]
 

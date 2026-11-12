@@ -19,12 +19,14 @@ from pipeline.validation import InvalidTransactionError, parse_transaction, vali
 class InvalidCSVError(Exception):
     """Un fichier CSV ne peut pas être chargé ; contient la liste des erreurs détectées."""
 
+    title = "Fichier CSV invalide"
+
     def __init__(self, path: Path | str, errors: list[str]) -> None:
         self.path = path
         self.errors = errors
         name = Path(str(path)).name
         details = "\n".join(f"  - {error}" for error in errors)
-        super().__init__(f"Fichier CSV invalide : {name} ({len(errors)} erreur(s))\n{details}")
+        super().__init__(f"{self.title} : {name} ({len(errors)} erreur(s))\n{details}")
 
 
 def compute_hash(content: bytes) -> str:

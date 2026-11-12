@@ -1,0 +1,3 @@
+# Les versions des paquets Debian ne sont pas figées : seule l'image de base l'est.
+ignored:
+  - DL3008

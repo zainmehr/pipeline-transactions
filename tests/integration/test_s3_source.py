@@ -200,7 +200,7 @@ def test_bucket_vide(pipeline_env, s3, tmp_path, capsys):
     config, client = s3
     ensure_bucket(client, config.bucket)
     assert main(["--input", str(tmp_path), "--source", "s3", "--save", *NO_WAIT]) == 1
-    assert "aucun fichier CSV dans" in capsys.readouterr().err
+    assert "aucun fichier CSV ou image dans" in capsys.readouterr().err
 
 
 def test_fichier_invalide_dans_le_bucket(pipeline_env, s3, tmp_path, capsys):
@@ -223,3 +223,15 @@ def test_montants_lus_depuis_s3_exacts(pipeline_env, s3, tmp_path):
     flags = dict(db.execute("SELECT montant, flag_montant_eleve FROM transactions").fetchall())
     assert flags[Decimal("5000.00")] is False
     assert flags[Decimal("5000.01")] is True
+
+
+def test_traitement_planifie_sur_bucket_inexistant(pipeline_env, s3, capsys):
+    """Le traitement planifié (CronJob) peut démarrer avant le premier dépôt de fichiers :
+    avec --allow-empty, il crée le bucket et se termine normalement."""
+    config, client = s3
+
+    assert main(["--source", "s3", "--save", "--allow-empty", *NO_WAIT]) == 0
+
+    client.head_bucket(Bucket=config.bucket)  # le bucket existe désormais
+    assert "0 nouveau(x) fichier(s) à traiter sur 0" in capsys.readouterr().out
+    assert count(pipeline_env, "processed_files") == 0

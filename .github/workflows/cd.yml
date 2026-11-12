@@ -1,0 +1,170 @@
+name: CD
+
+# Déploiement continu de l'environnement de production (niveau 3, option 1).
+#
+#   Pull Request ──> image Docker ──> cluster Kubernetes éphémère (kind) ──> vérifications
+#   CI verte sur main ──> mêmes étapes ──> publication de l'image (GHCR) ──> production
+#
+# L'environnement contient le stockage S3 (RustFS), la base PostgreSQL et le système de
+# traitement, lancé toutes les 2 minutes par un CronJob Kubernetes.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: cd-${{ github.event.workflow_run.head_branch || github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: pipeline-transactions:local
+
+jobs:
+  deploiement:
+    name: Déploiement Kubernetes (kind) et vérification
+    # Après la CI : uniquement si elle a réussi.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Construction de l'image Docker du système de traitement
+        run: docker build -t "$IMAGE" .
+
+      - name: Contrôle de l'image (Tesseract et pipeline)
+        run: |
+          docker run --rm --entrypoint tesseract "$IMAGE" --list-langs | grep -x fra
+          docker run --rm "$IMAGE" --help | head -5
+          docker run --rm --entrypoint id "$IMAGE"
+
+      - name: Création du cluster Kubernetes (kind)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pipeline
+
+      - name: Chargement de l'image dans le cluster
+        run: kind load docker-image "$IMAGE" --name pipeline
+
+      - name: Déploiement (PostgreSQL, stockage S3, CronJob de traitement)
+        run: scripts/k8s.sh deployer
+
+      - name: Premier traitement planifié sur un bucket vide (création du schéma)
+        run: scripts/k8s.sh attendre-traitement 0 300
+
+      - name: Dépôt de données (3 CSV et 2 relevés images) dans le bucket
+        run: scripts/k8s.sh deposer 42 3 2
+
+      - name: Traitement automatique des nouveaux fichiers par le CronJob
+        run: scripts/k8s.sh attendre-traitement 5 300
+
+      - name: Vérification de la base de production
+        run: scripts/k8s.sh verifier 5
+
+      - name: Nouveau dépôt (données déjà connues et nouvelles données)
+        run: |
+          scripts/k8s.sh deposer 42 3 2
+          scripts/k8s.sh deposer 7 2 1
+
+      - name: Seules les nouvelles données sont traitées
+        run: |
+          scripts/k8s.sh attendre-traitement 8 300
+          scripts/k8s.sh verifier 8
+
+      - name: Persistance des données après redémarrage de la base
+        run: |
+          kubectl -n pipeline-transactions delete pod postgres-0 --wait=true
+          until kubectl -n pipeline-transactions get pod postgres-0 >/dev/null 2>&1; do sleep 2; done
+          kubectl -n pipeline-transactions wait --for=condition=ready pod/postgres-0 --timeout=300s
+          scripts/k8s.sh lancer
+          scripts/k8s.sh verifier 8
+
+      - name: État final de l'environnement
+        if: always()
+        run: scripts/k8s.sh etat
+
+      - name: Diagnostic en cas d'échec
+        if: failure()
+        run: scripts/k8s.sh diagnostic
+
+  publication:
+    name: Publication de l'image (GHCR)
+    needs: deploiement
+    if: >-
+      github.event_name == 'workflow_run' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.nom.outputs.image }}
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Nom de l'image
+        id: nom
+        run: |
+          depot="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha="$(git rev-parse --short=12 HEAD)"
+          echo "image=$depot:$sha" >> "$GITHUB_OUTPUT"
+          echo "tags=$depot:$sha,$depot:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Connexion au registre GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construction et publication
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.nom.outputs.tags }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  production:
+    name: Déploiement en production
+    needs: publication
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # Le cluster de production est configuré par le secret KUBE_CONFIG (kubeconfig).
+      # Sans ce secret, l'environnement de production est celui vérifié dans kind.
+      - name: Déploiement sur le cluster de production
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+          IMAGE: ${{ needs.publication.outputs.image }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+        run: |
+          if [ -z "$KUBE_CONFIG" ]; then
+            echo "::notice::Secret KUBE_CONFIG absent : image $IMAGE publiée, pas de cluster distant configuré."
+            exit 0
+          fi
+          mkdir -p ~/.kube
+          printf '%s' "$KUBE_CONFIG" > ~/.kube/config
+          chmod 600 ~/.kube/config
+          scripts/k8s.sh deployer
+          scripts/k8s.sh etat

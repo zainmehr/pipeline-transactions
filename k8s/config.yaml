@@ -1,0 +1,13 @@
+# Configuration non sensible du système de traitement (mêmes variables que le fichier .env).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+data:
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: pipeline
+  S3_ENDPOINT_URL: http://rustfs:9000
+  S3_BUCKET: transactions
+  S3_REGION: us-east-1
+  OCR_LANG: fra
